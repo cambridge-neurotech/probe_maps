@@ -69,7 +69,7 @@ for sheet_name in tqdm(sheet_names, "Exporting CN probes"):
             fig, axes = plt.subplots(1, num_probes, figsize=(10 * num_probes, 12))
             for i, probe in enumerate(probegroup.probes):
                 ax = axes[i] if num_probes > 1 else axes
-                plot_probe(probe, ax=ax, with_contact_id=True)
+                plot_probe(probe, ax=ax, with_contact_id=False, with_device_index=False)
                 side_label = "Front" if i == 0 else "Back"
                 ax.set_title(f"{sheet_name} - {side_label}")
             plt.tight_layout()
@@ -113,7 +113,7 @@ for sheet_name in tqdm(sheet_names, "Exporting CN probes"):
             # Export PNG - single probe
             png_path = output_dir / f"{sheet_name}.png"
             fig, ax = plt.subplots(figsize=(10, 12))
-            plot_probe(probe, ax=ax, with_contact_id=True)
+            plot_probe(probe, ax=ax, with_contact_id=False, with_device_index=False)
             ax.set_title(sheet_name)
             plt.tight_layout()
             plt.savefig(png_path, dpi=150, bbox_inches="tight")

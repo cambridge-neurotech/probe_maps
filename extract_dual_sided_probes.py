@@ -558,7 +558,9 @@ class ProbeDataExtractor:
 
         return result_df
 
-    def _extend_multishank_contour(self, contour_df: pd.DataFrame) -> pd.DataFrame:
+    def _extend_multishank_contour(
+        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame = None
+    ) -> pd.DataFrame:
         """
         Extend multi-shank contour so each shank extends to near full length.
 
@@ -569,6 +571,7 @@ class ProbeDataExtractor:
 
         Args:
             contour_df: DataFrame with x, y columns and shank_length_mm
+            contacts_df: Optional DataFrame with contact positions and dimensions
 
         Returns:
             Extended contour DataFrame with individual shanks extended
@@ -583,6 +586,13 @@ class ProbeDataExtractor:
         shank_length_um = shank_length_mm * 1000
         merge_height = 200  # Height of merged section at top (µm)
         shank_top = shank_length_um - merge_height  # Where individual shanks extend to
+
+        # Get contact half-width for expanding contour bounds
+        contact_margin = 2.0  # Additional margin in µm
+        if contacts_df is not None and "width" in contacts_df.columns:
+            half_width = contacts_df["width"].max() / 2.0 + contact_margin
+        else:
+            half_width = contact_margin
 
         x_col = "x" if "x" in contour_df.columns else contour_df.columns[0]
         y_col = "y" if "y" in contour_df.columns else contour_df.columns[1]
@@ -603,19 +613,48 @@ class ProbeDataExtractor:
         tip_mask = y_values <= (current_min_y + tip_tolerance)
         tip_x_values = sorted(set(x_values[tip_mask]))
 
-        # Each tip X value corresponds to a shank center
-        # Find shank boundaries by looking at adjacent points in the original contour
+        # Use CONTACT positions to determine shank bounds (more reliable than contour geometry)
+        # This avoids issues with merge section points being misinterpreted
         shanks = []
-        for tip_x in tip_x_values:
-            # Find all points near this tip X
-            x_tolerance = 50  # µm
-            shank_mask = np.abs(x_values - tip_x) < x_tolerance
-            if not np.any(shank_mask):
-                continue
-            shank_x = x_values[shank_mask]
-            left_x = np.min(shank_x)
-            right_x = np.max(shank_x)
-            shanks.append((left_x, right_x, tip_x))
+        if contacts_df is not None and "x" in contacts_df.columns and len(contacts_df) > 0:
+            # Cluster contacts by X position to identify separate shanks
+            contact_x_values = sorted(contacts_df["x"].unique())
+            if len(contact_x_values) > 0:
+                # Find gaps in contact X positions (> 100 µm indicates separate shanks)
+                x_diffs = np.diff(contact_x_values)
+                gap_threshold = 100
+                gap_indices = np.where(x_diffs > gap_threshold)[0]
+
+                # Build shank bounds from contact clusters
+                start_idx = 0
+                for gap_idx in gap_indices:
+                    shank_contacts_x = contact_x_values[start_idx:gap_idx + 1]
+                    left_x = min(shank_contacts_x)
+                    right_x = max(shank_contacts_x)
+                    tip_x = (left_x + right_x) / 2
+                    shanks.append((left_x, right_x, tip_x))
+                    start_idx = gap_idx + 1
+                # Last shank
+                if start_idx < len(contact_x_values):
+                    shank_contacts_x = contact_x_values[start_idx:]
+                    left_x = min(shank_contacts_x)
+                    right_x = max(shank_contacts_x)
+                    tip_x = (left_x + right_x) / 2
+                    shanks.append((left_x, right_x, tip_x))
+
+        # Fallback: use tip X values from contour if no contacts found
+        if not shanks:
+            for tip_x in tip_x_values:
+                # Find points near this tip X that are ALSO near the tip Y
+                x_tolerance = 50  # µm
+                near_tip_y = y_values <= (current_min_y + tip_tolerance)
+                shank_mask = near_tip_y & (np.abs(x_values - tip_x) < x_tolerance)
+                if not np.any(shank_mask):
+                    continue
+                shank_x = x_values[shank_mask]
+                left_x = np.min(shank_x)
+                right_x = np.max(shank_x)
+                shanks.append((left_x, right_x, tip_x))
 
         # If we couldn't detect shanks, try alternative approach based on X gaps
         if not shanks:
@@ -653,45 +692,85 @@ class ProbeDataExtractor:
         # Sort shanks by X position (left to right)
         shanks = sorted(shanks, key=lambda s: s[2])
 
+        # Expand shank bounds by half_width to ensure contacts fit inside contour
+        shanks = [(left - half_width, right + half_width, tip_x) for left, right, tip_x in shanks]
+
+        # Determine the "tip region" height - only include original contour points
+        # that are in the lower portion (V-tip region), not the original merge section.
+        # Use max contact Y + margin, or a fraction of original contour height
+        if contacts_df is not None and "y" in contacts_df.columns and len(contacts_df) > 0:
+            max_contact_y = contacts_df["y"].max()
+            # Only include original points in the tip region (below max contact Y + small margin)
+            tip_region_max_y = max_contact_y + 50  # 50 µm above highest contact
+        else:
+            # Fallback: use lower 30% of original contour height as tip region
+            tip_region_max_y = current_min_y + (current_max_y - current_min_y) * 0.3
+
         # Build new contour with extended shanks
         new_points = []
 
-        # Overall bounds
+        # Overall bounds (already expanded via shank bounds)
         min_x = min(s[0] for s in shanks)
         max_x = max(s[1] for s in shanks)
 
         # Top edge of merged section (goes left to right)
         new_points.append((min_x, shank_length_um))
 
-        # For each shank, trace: down left side, tip, up right side
+        # For each shank, trace: down left side, V-tip, up right side
         for idx, (shank_left, shank_right, tip_x) in enumerate(shanks):
             # Left edge going down from merge to shank top
             new_points.append((shank_left, shank_top))
 
-            # Find original points for this shank
-            shank_mask = (x_values >= shank_left - 5) & (x_values <= shank_right + 5)
-            shank_points = list(zip(x_values[shank_mask], y_values[shank_mask]))
+            # Find the original V-tip apex for this shank
+            # Search in a wider X range to find the actual tip
+            search_margin = 100  # Search 100 µm beyond shank bounds for tip
+            tip_search_mask = (x_values >= shank_left - search_margin) & (
+                x_values <= shank_right + search_margin
+            )
+            tip_candidates = [
+                (x, y)
+                for x, y in zip(x_values[tip_search_mask], y_values[tip_search_mask])
+                if y <= current_min_y + 20  # Only points very close to minimum Y
+            ]
 
-            if shank_points:
-                # Split into left and right sides
-                mid_x = (shank_left + shank_right) / 2
-                left_side = [(x, y) for x, y in shank_points if x <= mid_x]
-                right_side = [(x, y) for x, y in shank_points if x > mid_x]
+            # Find the apex (point with minimum Y - the actual tip)
+            shank_center = (shank_left + shank_right) / 2
+            if tip_candidates:
+                # Pick the point with minimum Y (actual apex), not closest to center
+                tip_apex = min(tip_candidates, key=lambda p: p[1])
+                apex_x, apex_y = tip_apex
+            else:
+                # Fallback: use shank center at current minimum Y
+                apex_x = shank_center
+                apex_y = current_min_y
 
-                # Sort left side by y descending (going down)
-                left_side = sorted(left_side, key=lambda p: -p[1])
-                # Sort right side by y ascending (going up)
-                right_side = sorted(right_side, key=lambda p: p[1])
+            # Create V-tip that properly encloses all contacts
+            # First extend shank walls straight down to below the contact level,
+            # then angle to the apex. This ensures contacts are inside the contour.
 
-                # Add left side points (below shank_top)
-                for x, y in left_side:
-                    if y < shank_top - 5:
-                        new_points.append((x, y))
+            # Find the bottom of contacts for this shank
+            if contacts_df is not None and "y" in contacts_df.columns:
+                shank_contacts = contacts_df[
+                    (contacts_df["x"] >= shank_left) & (contacts_df["x"] <= shank_right)
+                ]
+                if len(shank_contacts) > 0:
+                    contact_min_y = shank_contacts["y"].min()
+                    contact_height = (
+                        shank_contacts["height"].iloc[0]
+                        if "height" in shank_contacts.columns
+                        else 15
+                    )
+                    contact_bottom = contact_min_y - contact_height / 2 - 5  # 5 µm margin
+                else:
+                    contact_bottom = apex_y + 30
+            else:
+                contact_bottom = apex_y + 30
 
-                # Add right side points
-                for x, y in right_side:
-                    if y < shank_top - 5:
-                        new_points.append((x, y))
+            # Extend shank walls down to contact_bottom, then angle to apex
+            # This ensures contacts are always inside the contour
+            new_points.append((shank_left, contact_bottom))
+            new_points.append((apex_x, apex_y))
+            new_points.append((shank_right, contact_bottom))
 
             # Right edge going up to shank top
             new_points.append((shank_right, shank_top))
@@ -845,7 +924,8 @@ class ProbeDataExtractor:
                 if is_multi_shank:
                     # For multi-shank probes: DON'T use buffer expansion
                     # Use special extension that extends each shank individually
-                    extended_df = self._extend_multishank_contour(df)
+                    # Pass contacts_df to account for contact widths in contour bounds
+                    extended_df = self._extend_multishank_contour(df, contacts_df)
                     logger.debug(f"{probe_name}: Multi-shank probe, extending shanks individually")
                 else:
                     # For single-shank probes: expand for contacts, then extend
