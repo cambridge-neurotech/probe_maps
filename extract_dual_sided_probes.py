@@ -502,18 +502,22 @@ class ProbeDataExtractor:
 
         return all_contacts, all_contours, metadata_list
 
-    def _extend_contour_to_shank_length(self, contour_df: pd.DataFrame) -> pd.DataFrame:
+    def _extend_contour_to_shank_length(
+        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame = None
+    ) -> pd.DataFrame:
         """
         Extend contour Y coordinates to match full shank length from database.
 
-        For single-shank probes only. This function finds points at the top edge
-        (max Y) and extends them to the full shank length.
+        For single-shank probes only. This function:
+        1. Centers the tip on the contacts (fixes off-center tips in source JSON)
+        2. Extends the top edge to full shank length
 
         Args:
             contour_df: DataFrame with x, y columns and shank_length_mm
+            contacts_df: Optional DataFrame with contact positions
 
         Returns:
-            Extended contour DataFrame with top edge at full shank length
+            Extended contour DataFrame with centered tip and top edge at full shank length
         """
         if contour_df.empty or "shank_length_mm" not in contour_df.columns:
             return contour_df
@@ -529,18 +533,55 @@ class ProbeDataExtractor:
         x_col = "x" if "x" in contour_df.columns else contour_df.columns[0]
         y_col = "y" if "y" in contour_df.columns else contour_df.columns[1]
 
-        x_values = contour_df[x_col].values.copy()
-        y_values = contour_df[y_col].values.copy()
+        x_values = contour_df[x_col].values.copy().astype(float)
+        y_values = contour_df[y_col].values.copy().astype(float)
 
         if len(y_values) == 0:
             return contour_df
+
+        # Check if contacts fit within original contour bounds
+        # Only center if contacts are OUTSIDE the contour (indicates misalignment)
+        if contacts_df is not None and "x" in contacts_df.columns and len(contacts_df) > 0:
+            contact_min_x = contacts_df["x"].min()
+            contact_max_x = contacts_df["x"].max()
+            contact_width = 11  # Default contact width
+            if "width" in contacts_df.columns:
+                contact_width = contacts_df["width"].max()
+
+            # Calculate contact bounds with padding
+            contact_left = contact_min_x - contact_width / 2 - 2
+            contact_right = contact_max_x + contact_width / 2 + 2
+
+            # Get original contour bounds
+            contour_min_x = np.min(x_values)
+            contour_max_x = np.max(x_values)
+
+            # Only center if contacts extend OUTSIDE the original contour
+            # This indicates the source JSON tip is misaligned
+            contacts_outside = contact_left < contour_min_x or contact_right > contour_max_x
+
+            if contacts_outside:
+                # Find the center X of contacts
+                contact_center_x = (contact_min_x + contact_max_x) / 2
+
+                # Find the current tip apex (minimum Y point)
+                apex_idx = np.argmin(y_values)
+                original_apex_x = x_values[apex_idx]
+
+                # Calculate offset to center the contour on contacts
+                x_offset = contact_center_x - original_apex_x
+
+                # Shift all X values to center the tip
+                if abs(x_offset) > 1.0:  # Only shift if offset is significant
+                    x_values = x_values + x_offset
+                    logger.debug(f"Centered contour tip: shifted X by {x_offset:.1f} µm")
 
         # Find the current max Y in the contour
         current_max_y = np.max(y_values)
 
         # If contour already extends to or beyond shank length, no change needed
         if current_max_y >= shank_length_um:
-            result_df = contour_df[[x_col, y_col]].copy()
+            result_df = pd.DataFrame({x_col: x_values, y_col: y_values})
             return result_df
 
         # Find all points that are at the top edge (at or near max Y)
@@ -559,7 +600,7 @@ class ProbeDataExtractor:
         return result_df
 
     def _extend_multishank_contour(
-        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame = None
+        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame = None, probe_name: str = None
     ) -> pd.DataFrame:
         """
         Extend multi-shank contour so each shank extends to near full length.
@@ -567,11 +608,13 @@ class ProbeDataExtractor:
         For multi-shank probes, extends each individual shank from its current
         top up to near the shank length, with all shanks merging at the very top.
 
-        Shanks are identified by finding V-tips (local minima in Y at distinct X positions).
+        IMPORTANT: This function uses tip_length from a database based on probe type
+        to ensure consistent tip depths regardless of source JSON quality.
 
         Args:
             contour_df: DataFrame with x, y columns and shank_length_mm
             contacts_df: Optional DataFrame with contact positions and dimensions
+            probe_name: Probe name to extract probe type for tip_length lookup
 
         Returns:
             Extended contour DataFrame with individual shanks extended
@@ -601,181 +644,173 @@ class ProbeDataExtractor:
         y_values = contour_df[y_col].values.astype(float)
 
         current_max_y = np.max(y_values)
-        current_min_y = np.min(y_values)
+        current_min_y = np.min(y_values)  # The tip apex Y from original contour
 
         # If already extended, just return
         if current_max_y >= shank_length_um:
             return contour_df[[x_col, y_col]].copy()
 
-        # Find V-tips: points at or near the minimum Y value
-        # These define the tip of each shank
-        tip_tolerance = 20  # µm
-        tip_mask = y_values <= (current_min_y + tip_tolerance)
-        tip_x_values = sorted(set(x_values[tip_mask]))
-
-        # Use CONTACT positions to determine shank bounds (more reliable than contour geometry)
-        # This avoids issues with merge section points being misinterpreted
+        # Detect shanks from contact positions (most reliable)
         shanks = []
         if contacts_df is not None and "x" in contacts_df.columns and len(contacts_df) > 0:
-            # Cluster contacts by X position to identify separate shanks
             contact_x_values = sorted(contacts_df["x"].unique())
             if len(contact_x_values) > 0:
-                # Find gaps in contact X positions (> 100 µm indicates separate shanks)
                 x_diffs = np.diff(contact_x_values)
                 gap_threshold = 100
                 gap_indices = np.where(x_diffs > gap_threshold)[0]
 
-                # Build shank bounds from contact clusters
                 start_idx = 0
                 for gap_idx in gap_indices:
                     shank_contacts_x = contact_x_values[start_idx:gap_idx + 1]
                     left_x = min(shank_contacts_x)
                     right_x = max(shank_contacts_x)
                     tip_x = (left_x + right_x) / 2
-                    shanks.append((left_x, right_x, tip_x))
+                    # Get min Y for this shank's contacts
+                    shank_contacts = contacts_df[
+                        (contacts_df["x"] >= left_x) & (contacts_df["x"] <= right_x)
+                    ]
+                    min_contact_y = shank_contacts["y"].min() if len(shank_contacts) > 0 else 0
+                    shanks.append((left_x, right_x, tip_x, min_contact_y))
                     start_idx = gap_idx + 1
-                # Last shank
                 if start_idx < len(contact_x_values):
                     shank_contacts_x = contact_x_values[start_idx:]
                     left_x = min(shank_contacts_x)
                     right_x = max(shank_contacts_x)
                     tip_x = (left_x + right_x) / 2
-                    shanks.append((left_x, right_x, tip_x))
-
-        # Fallback: use tip X values from contour if no contacts found
-        if not shanks:
-            for tip_x in tip_x_values:
-                # Find points near this tip X that are ALSO near the tip Y
-                x_tolerance = 50  # µm
-                near_tip_y = y_values <= (current_min_y + tip_tolerance)
-                shank_mask = near_tip_y & (np.abs(x_values - tip_x) < x_tolerance)
-                if not np.any(shank_mask):
-                    continue
-                shank_x = x_values[shank_mask]
-                left_x = np.min(shank_x)
-                right_x = np.max(shank_x)
-                shanks.append((left_x, right_x, tip_x))
-
-        # If we couldn't detect shanks, try alternative approach based on X gaps
-        if not shanks:
-            # Group contour points by X coordinate clustering
-            unique_x = sorted(set(x_values))
-            if len(unique_x) >= 2:
-                # Find large gaps in X (> 100 µm) to separate shanks
-                x_diffs = np.diff(unique_x)
-                gap_threshold = 100
-                gap_indices = np.where(x_diffs > gap_threshold)[0]
-
-                # Each segment between gaps is a shank
-                start_idx = 0
-                for gap_idx in gap_indices:
-                    shank_x_range = unique_x[start_idx:gap_idx + 1]
-                    if len(shank_x_range) >= 2:
-                        left_x = min(shank_x_range)
-                        right_x = max(shank_x_range)
-                        tip_x = (left_x + right_x) / 2
-                        shanks.append((left_x, right_x, tip_x))
-                    start_idx = gap_idx + 1
-                # Last segment
-                if start_idx < len(unique_x):
-                    shank_x_range = unique_x[start_idx:]
-                    if len(shank_x_range) >= 2:
-                        left_x = min(shank_x_range)
-                        right_x = max(shank_x_range)
-                        tip_x = (left_x + right_x) / 2
-                        shanks.append((left_x, right_x, tip_x))
+                    shank_contacts = contacts_df[
+                        (contacts_df["x"] >= left_x) & (contacts_df["x"] <= right_x)
+                    ]
+                    min_contact_y = shank_contacts["y"].min() if len(shank_contacts) > 0 else 0
+                    shanks.append((left_x, right_x, tip_x, min_contact_y))
 
         if not shanks:
-            # Fallback: just extend top points like single-shank
-            return self._extend_contour_to_shank_length(contour_df)
+            return self._extend_contour_to_shank_length(contour_df, contacts_df)
 
         # Sort shanks by X position (left to right)
         shanks = sorted(shanks, key=lambda s: s[2])
 
         # Expand shank bounds by half_width to ensure contacts fit inside contour
-        shanks = [(left - half_width, right + half_width, tip_x) for left, right, tip_x in shanks]
+        shanks = [
+            (left - half_width, right + half_width, tip_x, min_y)
+            for left, right, tip_x, min_y in shanks
+        ]
 
-        # Determine the "tip region" height - only include original contour points
-        # that are in the lower portion (V-tip region), not the original merge section.
-        # Use max contact Y + margin, or a fraction of original contour height
+        # Tip length database based on Cambridge NeuroTech reference image
+        # tip_length = how far below lowest contact the apex extends
+        TIP_LENGTH_DB = {
+            "E": 70,      # E-type: 40 µm tip width, ~70 µm extension
+            "E-1": 70,
+            "E-2": 70,
+            "P": 70,      # P-type: 25 µm tip width, ~70 µm extension
+            "P-1": 70,
+            "P-2": 70,
+            "F": 50,      # F-type: 25 µm tip width, ~50 µm extension
+            "Fb": 50,
+            "H10": 50,    # H10: 30 µm tip width
+            "H6": 65,     # H6: 30 µm tip width
+            "H7": 65,     # H7: 50 µm tip width, longer tip
+            "H2": 28,     # H2: 25 µm tip width
+            "H3": 28,     # H3: 20 µm tip width
+            "H5": 30,     # H5: 25 µm tip width
+            "H8": 100,    # H8: 60 µm tip width, longer tip
+            "H9": 55,     # H9: 45 µm tip width
+            "L1": 28,     # L-series: 18 µm tip width
+            "L2": 28,
+            "L3": 28,
+            "M1": 50,     # M-series
+            "M2": 50,
+            "H1": 40,
+            "H4": 28,
+            "H12": 28,
+            "H13": 28,
+            "H14": 20,
+            "H15": 20,
+            "H16": 20,
+            "H20": 20,
+        }
+
+        # Get tip length for this probe type
+        tip_length = 50  # Default tip length
+
+        # Extract probe type from probe_name (e.g., "ASSY-77-E-1" -> "E-1")
+        probe_type = None
+        if probe_name:
+            probe_type = self._get_probe_type_from_folder(probe_name)
+
+        if probe_type:
+            # Try exact match first, then prefix match
+            if probe_type in TIP_LENGTH_DB:
+                tip_length = TIP_LENGTH_DB[probe_type]
+            else:
+                # Try to find a matching prefix (e.g., "E-1" matches "E")
+                for key in sorted(TIP_LENGTH_DB.keys(), key=len, reverse=True):
+                    if probe_type.startswith(key):
+                        tip_length = TIP_LENGTH_DB[key]
+                        break
+
+        logger.debug(f"Probe {probe_name}: type={probe_type}, tip_length={tip_length}")
+
+        # Calculate apex Y based on lowest contact and tip_length
+        # This ensures consistent tip depth regardless of source JSON quality
+        # Find the minimum contact Y across all shanks
         if contacts_df is not None and "y" in contacts_df.columns and len(contacts_df) > 0:
-            max_contact_y = contacts_df["y"].max()
-            # Only include original points in the tip region (below max contact Y + small margin)
-            tip_region_max_y = max_contact_y + 50  # 50 µm above highest contact
+            global_min_contact_y = contacts_df["y"].min()
+            contact_height = 15
+            if "height" in contacts_df.columns:
+                contact_height = contacts_df["height"].max()
+            # Apex is tip_length below the lowest contact
+            apex_y = global_min_contact_y - contact_height / 2 - tip_length
         else:
-            # Fallback: use lower 30% of original contour height as tip region
-            tip_region_max_y = current_min_y + (current_max_y - current_min_y) * 0.3
+            # Fallback to original contour minimum
+            apex_y = current_min_y
 
-        # Build new contour with extended shanks
+        # Build new contour with extended shanks and PRESERVED tip geometry
         new_points = []
 
-        # Overall bounds (already expanded via shank bounds)
+        # Overall bounds
         min_x = min(s[0] for s in shanks)
         max_x = max(s[1] for s in shanks)
 
-        # Top edge of merged section (goes left to right)
+        # Top edge of merged section
         new_points.append((min_x, shank_length_um))
 
-        # For each shank, trace: down left side, V-tip, up right side
-        for idx, (shank_left, shank_right, tip_x) in enumerate(shanks):
-            # Left edge going down from merge to shank top
+        for idx, (shank_left, shank_right, tip_x, min_contact_y) in enumerate(shanks):
+            shank_center = (shank_left + shank_right) / 2
+
+            # Use the original apex Y from source contour (proper tip depth)
+            # Center the apex X on the contacts
+            apex_x = shank_center
+
+            # Contact dimensions
+            contact_height = 15  # Default contact height
+            if contacts_df is not None and "height" in contacts_df.columns:
+                contact_height = contacts_df["height"].max()
+
+            # Calculate where straight walls transition to V-tip
+            # Walls go straight down to just below the lowest contact, then taper to apex
+            contact_bottom = min_contact_y - contact_height / 2 - 5  # 5 µm margin
+
+            # IMPORTANT: contact_bottom must be ABOVE the apex to create proper V-tip
+            # If contacts extend below the apex, walls stop at apex level
+            if contact_bottom < apex_y:
+                contact_bottom = apex_y + 5
+
+            # Left edge: from merge down to shank top
             new_points.append((shank_left, shank_top))
 
-            # Find the original V-tip apex for this shank
-            # Search in a wider X range to find the actual tip
-            search_margin = 100  # Search 100 µm beyond shank bounds for tip
-            tip_search_mask = (x_values >= shank_left - search_margin) & (
-                x_values <= shank_right + search_margin
-            )
-            tip_candidates = [
-                (x, y)
-                for x, y in zip(x_values[tip_search_mask], y_values[tip_search_mask])
-                if y <= current_min_y + 20  # Only points very close to minimum Y
-            ]
-
-            # Find the apex (point with minimum Y - the actual tip)
-            shank_center = (shank_left + shank_right) / 2
-            if tip_candidates:
-                # Pick the point with minimum Y (actual apex), not closest to center
-                tip_apex = min(tip_candidates, key=lambda p: p[1])
-                apex_x, apex_y = tip_apex
-            else:
-                # Fallback: use shank center at current minimum Y
-                apex_x = shank_center
-                apex_y = current_min_y
-
-            # Create V-tip that properly encloses all contacts
-            # First extend shank walls straight down to below the contact level,
-            # then angle to the apex. This ensures contacts are inside the contour.
-
-            # Find the bottom of contacts for this shank
-            if contacts_df is not None and "y" in contacts_df.columns:
-                shank_contacts = contacts_df[
-                    (contacts_df["x"] >= shank_left) & (contacts_df["x"] <= shank_right)
-                ]
-                if len(shank_contacts) > 0:
-                    contact_min_y = shank_contacts["y"].min()
-                    contact_height = (
-                        shank_contacts["height"].iloc[0]
-                        if "height" in shank_contacts.columns
-                        else 15
-                    )
-                    contact_bottom = contact_min_y - contact_height / 2 - 5  # 5 µm margin
-                else:
-                    contact_bottom = apex_y + 30
-            else:
-                contact_bottom = apex_y + 30
-
-            # Extend shank walls down to contact_bottom, then angle to apex
-            # This ensures contacts are always inside the contour
+            # Straight wall down to contact level
             new_points.append((shank_left, contact_bottom))
+
+            # V-tip: angle from left wall to apex, then to right wall
             new_points.append((apex_x, apex_y))
+
+            # Right side of V-tip
             new_points.append((shank_right, contact_bottom))
 
-            # Right edge going up to shank top
+            # Right edge: up to shank top
             new_points.append((shank_right, shank_top))
 
-            # If not last shank, add gap to next shank at shank_top level
+            # If not last shank, add gap to next shank
             if idx < len(shanks) - 1:
                 next_shank_left = shanks[idx + 1][0]
                 new_points.append((next_shank_left, shank_top))
@@ -925,12 +960,14 @@ class ProbeDataExtractor:
                     # For multi-shank probes: DON'T use buffer expansion
                     # Use special extension that extends each shank individually
                     # Pass contacts_df to account for contact widths in contour bounds
-                    extended_df = self._extend_multishank_contour(df, contacts_df)
+                    # Pass probe_name to look up tip_length from database
+                    extended_df = self._extend_multishank_contour(df, contacts_df, probe_name)
                     logger.debug(f"{probe_name}: Multi-shank probe, extending shanks individually")
                 else:
                     # For single-shank probes: expand for contacts, then extend
+                    # Pass contacts_df to center the tip on contacts
                     expanded_df = self._expand_contour_for_contacts(df, contacts_df)
-                    extended_df = self._extend_contour_to_shank_length(expanded_df)
+                    extended_df = self._extend_contour_to_shank_length(expanded_df, contacts_df)
 
                 extended_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
