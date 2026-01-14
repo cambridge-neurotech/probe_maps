@@ -353,8 +353,13 @@ class ProbeDataExtractor:
             if not isinstance(contact_shapes, list):
                 contact_shapes = ["circle"] * len(contact_positions)
 
-            shape_params = probe_obj.get("contact_shape_params", {})
-            if isinstance(shape_params, dict):
+            shape_params = probe_obj.get("contact_shape_params", [])
+            if isinstance(shape_params, list) and len(shape_params) > 0:
+                # List of dicts format: [{"width": 5, "height": 5}, ...]
+                widths = [p.get("width", 11) if isinstance(p, dict) else 11 for p in shape_params]
+                heights = [p.get("height", 15) if isinstance(p, dict) else 15 for p in shape_params]
+            elif isinstance(shape_params, dict):
+                # Dict with lists format: {"width": [5, 5, ...], "height": [5, 5, ...]}
                 widths = shape_params.get("width", [11] * len(contact_positions))
                 heights = shape_params.get("height", [15] * len(contact_positions))
             else:
@@ -656,7 +661,7 @@ class ProbeDataExtractor:
             contact_x_values = sorted(contacts_df["x"].unique())
             if len(contact_x_values) > 0:
                 x_diffs = np.diff(contact_x_values)
-                gap_threshold = 100
+                gap_threshold = 60  # Lower to detect H10/F8/H16 gaps (68-95µm)
                 gap_indices = np.where(x_diffs > gap_threshold)[0]
 
                 start_idx = 0
@@ -764,58 +769,88 @@ class ProbeDataExtractor:
             # Fallback to original contour minimum
             apex_y = current_min_y
 
-        # Build new contour with extended shanks and PRESERVED tip geometry
+        # PRESERVE original contour shape (tapered geometry) and ADD straight walls above
+        # Strategy: Keep all original points, then add new points to extend straight up
+        # from the original top to the target shank length.
+
+        # Find the original top Y (where straight walls should start)
+        original_top_y = current_max_y
+
+        # Overall bounds for the merged top section
+        min_x = min(x_values)
+        max_x = max(x_values)
+
+        # Group points by shank (detect gaps in X)
+        # Sort points by X to identify shank boundaries
+        points_with_idx = [(x, y, i) for i, (x, y) in enumerate(zip(x_values, y_values))]
+
+        # Find the "top edge" X values for each shank (points at or near max Y)
+        top_edge_tolerance = 50  # Points within 50µm of max_y are considered "top edge"
+        top_edge_points = [(x, y) for x, y in zip(x_values, y_values)
+                          if y >= original_top_y - top_edge_tolerance]
+
+        # Build new contour: keep original shape, add extensions above
         new_points = []
 
-        # Overall bounds
-        min_x = min(s[0] for s in shanks)
-        max_x = max(s[1] for s in shanks)
-
-        # Top edge of merged section
+        # Start with top-left corner at full shank length
         new_points.append((min_x, shank_length_um))
 
-        for idx, (shank_left, shank_right, tip_x, min_contact_y) in enumerate(shanks):
-            shank_center = (shank_left + shank_right) / 2
+        # Process original points and insert extension points where needed
+        prev_at_top = False
+        for i, (x, y) in enumerate(zip(x_values, y_values)):
+            at_top = (y >= original_top_y - top_edge_tolerance)
 
-            # Use the original apex Y from source contour (proper tip depth)
-            # Center the apex X on the contacts
-            apex_x = shank_center
+            if at_top and not prev_at_top:
+                # Transitioning TO top edge - add extension point first
+                new_points.append((x, shank_top))
 
-            # Contact dimensions
-            contact_height = 15  # Default contact height
-            if contacts_df is not None and "height" in contacts_df.columns:
-                contact_height = contacts_df["height"].max()
+            # Add original point (preserve taper geometry)
+            new_points.append((x, y))
 
-            # Calculate where straight walls transition to V-tip
-            # Walls go straight down to just below the lowest contact, then taper to apex
-            contact_bottom = min_contact_y - contact_height / 2 - 5  # 5 µm margin
+            if not at_top and prev_at_top:
+                # Transitioning FROM top edge - already handled by keeping original point
+                pass
 
-            # IMPORTANT: contact_bottom must be ABOVE the apex to create proper V-tip
-            # If contacts extend below the apex, walls stop at apex level
-            if contact_bottom < apex_y:
-                contact_bottom = apex_y + 5
+            prev_at_top = at_top
 
-            # Left edge: from merge down to shank top
-            new_points.append((shank_left, shank_top))
+        # Close with top-right corner at full shank length
+        new_points.append((max_x, shank_length_um))
 
-            # Straight wall down to contact level
-            new_points.append((shank_left, contact_bottom))
+        # Strategy: The contour traces down each shank and jumps horizontally between shanks.
+        # For each gap (horizontal jump at top), we need to add vertical extensions on both sides.
+        # Original: ... (66.5, 225) → (240, 230) ...  (jump across gap)
+        # Extended: ... (66.5, 225) → (66.5, 5800) → (240, 5800) → (240, 230) ...
 
-            # V-tip: angle from left wall to apex, then to right wall
-            new_points.append((apex_x, apex_y))
+        top_threshold = 50  # Points within 50µm of max_y are "top" points
+        gap_threshold = 60  # X jump > 60µm indicates gap between shanks (H10/F8/H16 have 68-95µm gaps)
 
-            # Right side of V-tip
-            new_points.append((shank_right, contact_bottom))
+        new_points = []
+        new_points.append((min_x, shank_length_um))  # Top-left corner of merged section
+        new_points.append((min_x, shank_top))  # Extension point on left edge
 
-            # Right edge: up to shank top
-            new_points.append((shank_right, shank_top))
+        n = len(x_values)
+        for i in range(n):
+            x, y = x_values[i], y_values[i]
+            is_top = (y >= original_top_y - top_threshold)
 
-            # If not last shank, add gap to next shank
-            if idx < len(shanks) - 1:
-                next_shank_left = shanks[idx + 1][0]
-                new_points.append((next_shank_left, shank_top))
+            # Add current point
+            new_points.append((x, y))
 
-        # Close at top-right of merged section
+            # Check if this is followed by a horizontal jump (gap between shanks)
+            if i < n - 1:
+                next_x, next_y = x_values[i + 1], y_values[i + 1]
+                is_next_top = (next_y >= original_top_y - top_threshold)
+                x_jump = abs(next_x - x)
+
+                # If both current and next are "top" points with a large X gap, add extensions
+                if is_top and is_next_top and x_jump > gap_threshold:
+                    # Add vertical extension from current point up
+                    new_points.append((x, shank_top))
+                    # Add horizontal connection at extended height
+                    new_points.append((next_x, shank_top))
+
+        # Add extension on right edge and close at top
+        new_points.append((max_x, shank_top))
         new_points.append((max_x, shank_length_um))
 
         # Remove duplicates while preserving order
@@ -969,6 +1004,9 @@ class ProbeDataExtractor:
                     expanded_df = self._expand_contour_for_contacts(df, contacts_df)
                     extended_df = self._extend_contour_to_shank_length(expanded_df, contacts_df)
 
+                # Update the dict with extended contours (for sanity checks)
+                contours_dict[probe_name] = extended_df
+
                 extended_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
     def _detect_shank_ids_from_positions(
@@ -1100,7 +1138,7 @@ class ProbeDataExtractor:
         return None
 
     def write_sanity_checks(
-        self, contacts_dict: Dict, metadata_list: List[Dict]
+        self, contacts_dict: Dict, metadata_list: List[Dict], contours_dict: Dict = None
     ) -> None:
         """
         Write sanity check files for ALL probes using probeinterface.
@@ -1109,9 +1147,14 @@ class ProbeDataExtractor:
         1. Check for non-unique contact IDs (CRITICAL - must be unique)
         2. Detect shanks from X position clusters
         3. Validate shank count against database
-        4. Create probeinterface Probe objects with actual JSON contours
+        4. Create probeinterface Probe objects with extended contours
         5. Save as probeinterface JSON format
         6. Plot using probeinterface plotting functions
+
+        Args:
+            contacts_dict: Dict of probe name -> contacts DataFrame
+            metadata_list: List of metadata dicts for each probe
+            contours_dict: Dict of probe name -> extended contours DataFrame (optional)
         """
         import matplotlib.pyplot as plt
         import numpy as np
@@ -1135,7 +1178,16 @@ class ProbeDataExtractor:
 
             df = contacts_dict[probe_name].reset_index()
             is_dual = metadata["is_dual_sided"]
-            raw_contour = metadata.get("raw_contour_2d", [])
+
+            # Use extended contours from contours_dict if available, else fall back to raw
+            extended_contour = None
+            if contours_dict and probe_name in contours_dict:
+                contour_df = contours_dict[probe_name]
+                if not contour_df.empty and "x" in contour_df.columns and "y" in contour_df.columns:
+                    extended_contour = contour_df[["x", "y"]].values.tolist()
+
+            # Fall back to raw contour if no extended contour available
+            raw_contour = extended_contour if extended_contour else metadata.get("raw_contour_2d", [])
 
             # 1. Check for non-unique contact IDs (CRITICAL)
             contact_ids = df["contact_ids"].tolist()
@@ -1171,108 +1223,134 @@ class ProbeDataExtractor:
                         f"({detected_shank_count} shanks)"
                     )
 
-            # 4. Create probeinterface Probe objects
+            # 4. Create probeinterface Probe object with native contact_sides support
+            # Uses PR #382 feature: contact_sides parameter in set_contacts()
             probegroup = pi.ProbeGroup()
 
-            # Determine sides to process
-            if is_dual and "contact_sides" in df.columns:
-                sides = ["front", "back"]
+            # Create probe with 2D coordinates for visualization
+            # For both dual-sided and single-sided probes: x, y (y is vertical position)
+            # z is the depth/side indicator for dual-sided, or shank thickness for single-sided
+            positions = np.column_stack([
+                df["x"].values,
+                df["y"].values
+            ])
+
+            # Build shape_params as list of dicts (one per contact)
+            if "width" in df.columns:
+                widths = df["width"].values
             else:
-                sides = [None]  # Single side, no filtering
+                widths = [12] * len(df)
+            if "height" in df.columns:
+                heights = df["height"].values
+            else:
+                heights = [12] * len(df)
+            shape_params = [
+                {"width": float(w), "height": float(h)}
+                for w, h in zip(widths, heights)
+            ]
 
-            for side in sides:
-                if side is not None:
-                    side_df = df[df["contact_sides"] == side]
-                    if len(side_df) == 0:
-                        continue
-                else:
-                    side_df = df
+            if "contact_shapes" in df.columns:
+                shapes = df["contact_shapes"].values
+            else:
+                shapes = ["rect"] * len(df)
 
-                # Create probe with 2D coordinates for visualization
-                # For both dual-sided and single-sided probes: x, y (y is vertical position)
-                # z is the depth/side indicator for dual-sided, or shank thickness for single-sided
-                vertical_coords = side_df["y"].values
+            # Detect shank IDs from X position clusters
+            x_positions = df["x"].tolist()
+            shank_ids = self._detect_shank_ids_from_positions(x_positions)
 
-                positions = np.column_stack([
-                    side_df["x"].values,
-                    vertical_coords
+            probe = pi.Probe(ndim=2)
+
+            # For dual-sided probes, use native contact_sides parameter (PR #382)
+            if is_dual and "contact_sides" in df.columns:
+                # Get contact_sides values, converting empty strings to None
+                contact_sides_raw = df["contact_sides"].values
+                contact_sides = np.array([
+                    s if s in ("front", "back") else None
+                    for s in contact_sides_raw
                 ])
 
-                # Build shape_params as list of dicts (one per contact)
-                if "width" in side_df.columns:
-                    widths = side_df["width"].values
-                else:
-                    widths = [12] * len(side_df)
-                if "height" in side_df.columns:
-                    heights = side_df["height"].values
-                else:
-                    heights = [12] * len(side_df)
-                shape_params = [
-                    {"width": float(w), "height": float(h)}
-                    for w, h in zip(widths, heights)
-                ]
-
-                if "contact_shapes" in side_df.columns:
-                    shapes = side_df["contact_shapes"].values
-                else:
-                    shapes = ["rect"] * len(side_df)
-
-                probe = pi.Probe(ndim=2)
                 probe.set_contacts(
                     positions=positions,
                     shapes=shapes,
-                    shape_params=shape_params
+                    shape_params=shape_params,
+                    shank_ids=np.array(shank_ids),
+                    contact_sides=contact_sides,  # Native dual-sided support from PR #382
+                )
+                logger.debug(f"  {probe_name}: Using native contact_sides parameter")
+            else:
+                probe.set_contacts(
+                    positions=positions,
+                    shapes=shapes,
+                    shape_params=shape_params,
+                    shank_ids=np.array(shank_ids),
                 )
 
-                # Set contact IDs
-                probe.set_contact_ids(side_df["contact_ids"].values)
+            # Set contact IDs
+            probe.set_contact_ids(df["contact_ids"].values)
 
-                # Set shank IDs from detected clusters (not from empty JSON values)
-                side_x_positions = side_df["x"].tolist()
-                side_shank_ids = self._detect_shank_ids_from_positions(side_x_positions)
-                probe.set_shank_ids(np.array(side_shank_ids))
+            # 5. Set contour - prefer JSON contour if available, fallback to auto-shape
+            # JSON contours preserve special geometries (V-shaped tips in E-1/E-2)
+            if raw_contour and len(raw_contour) > 2:
+                # Use actual contour from source JSON (preserves V-shaped tips, etc.)
+                contour_array = np.array(raw_contour)
+                probe.set_planar_contour(contour_array)
+            else:
+                # Fallback to auto-generated per-shank contours
+                probe.create_auto_shape(probe_type="tip")
 
-                # 5. Set contour - prefer JSON contour if available, fallback to auto-shape
-                # JSON contours preserve special geometries (V-shaped tips in E-1/E-2)
-                if raw_contour and len(raw_contour) > 2:
-                    # Use actual contour from source JSON (preserves V-shaped tips, etc.)
-                    contour_array = np.array(raw_contour)
-                    probe.set_planar_contour(contour_array)
-                else:
-                    # Fallback to auto-generated per-shank contours
-                    probe.create_auto_shape(probe_type="tip")
-
-                probegroup.add_probe(probe)
+            probegroup.add_probe(probe)
 
             # 6. Save as probeinterface JSON
             json_path = sanity_dir / f"{probe_name}_sanity.json"
             pi.write_probeinterface(str(json_path), probegroup)
 
-            # 7. Plot using probeinterface plotting
-            png_path = sanity_dir / f"{probe_name}_sanity.png"
-            num_probes = len(probegroup.probes)
+            # 7. Plot using custom rendering (probeinterface doesn't handle concave contours)
+            from matplotlib.patches import Polygon as MplPolygon
 
-            if num_probes == 0:
+            png_path = sanity_dir / f"{probe_name}_sanity.png"
+
+            if len(probegroup.probes) == 0:
                 logger.warning(f"  {probe_name}: No probes to plot")
                 continue
 
-            if num_probes == 1:
+            probe = probegroup.probes[0]
+
+            # For dual-sided probes, use probeinterface's side parameter (PR #382)
+            # to create separate plots for front and back
+            if is_dual and "contact_sides" in df.columns:
+                fig, axes = plt.subplots(1, 2, figsize=(20, 12))
+
+                for i, side_name in enumerate(["front", "back"]):
+                    ax = axes[i]
+                    # Draw contour manually FIRST (handles concave polygons correctly)
+                    if probe.probe_planar_contour is not None:
+                        contour = probe.probe_planar_contour
+                        poly = MplPolygon(contour, closed=True, facecolor="lightgreen",
+                                          edgecolor="green", alpha=0.5, linewidth=1, zorder=1)
+                        ax.add_patch(poly)
+                    # Draw contacts using probeinterface with side filter (PR #382)
+                    plot_probe(probe, ax=ax, with_contact_id=False, side=side_name,
+                               probe_shape_kwargs={"facecolor": "none", "edgecolor": "none", "alpha": 0})
+                    title = f"{probe_name} - {side_name.capitalize()}"
+                    if has_duplicates:
+                        title += "\n⚠️ DUPLICATE IDs"
+                    ax.set_title(title)
+            else:
+                # Single-sided probes: single plot
                 fig, ax = plt.subplots(figsize=(10, 12))
-                plot_probe(probegroup.probes[0], ax=ax, with_contact_id=True)
+                # Draw contour manually FIRST (handles concave polygons correctly)
+                if probe.probe_planar_contour is not None:
+                    contour = probe.probe_planar_contour
+                    poly = MplPolygon(contour, closed=True, facecolor="lightgreen",
+                                      edgecolor="green", alpha=0.5, linewidth=1, zorder=1)
+                    ax.add_patch(poly)
+                # Draw contacts using probeinterface (hide its contour completely)
+                plot_probe(probe, ax=ax, with_contact_id=False,
+                           probe_shape_kwargs={"facecolor": "none", "edgecolor": "none", "alpha": 0})
                 title = f"{probe_name}"
                 if has_duplicates:
                     title += "\n⚠️ DUPLICATE IDs"
                 ax.set_title(title)
-            else:
-                fig, axes = plt.subplots(1, num_probes, figsize=(10 * num_probes, 12))
-                for i, probe in enumerate(probegroup.probes):
-                    ax = axes[i] if num_probes > 1 else axes
-                    plot_probe(probe, ax=ax, with_contact_id=True)
-                    side_label = "Front" if i == 0 else "Back"
-                    title = f"{probe_name} - {side_label}"
-                    if has_duplicates:
-                        title += "\n⚠️ DUPLICATE IDs"
-                    ax.set_title(title)
 
             plt.tight_layout()
             plt.savefig(png_path, dpi=150, bbox_inches="tight")
@@ -1444,8 +1522,8 @@ def main() -> int:
     # Write to Excel
     extractor.write_excel_files(contacts, contours)
 
-    # Write sanity check files for dual-sided probes
-    extractor.write_sanity_checks(contacts, metadata)
+    # Write sanity check files for all probes (using extended contours)
+    extractor.write_sanity_checks(contacts, metadata, contours)
 
     # Print summary and check for validation errors
     validation_passed = extractor.generate_summary(metadata)
