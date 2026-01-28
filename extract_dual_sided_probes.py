@@ -990,9 +990,20 @@ class ProbeDataExtractor:
         if "height" in contacts_df.columns:
             contact_height = contacts_df["height"].max()
 
-        # Get contact bounds
+        # Get contact bounds and dimensions
         positions = contacts_df[["x", "y"]].values
         y_min = float(np.min(positions[:, 1]))
+        x_min = float(np.min(positions[:, 0]))
+        x_max = float(np.max(positions[:, 0]))
+
+        # Get contact width for margin calculation
+        contact_width = 12.0  # Default
+        if "width" in contacts_df.columns:
+            contact_width = contacts_df["width"].max()
+
+        # Calculate minimum half-width needed to contain all electrodes
+        margin = 5.0  # µm margin around contacts
+        min_half_width_for_contacts = max(abs(x_min), abs(x_max)) + contact_width / 2 + margin
 
         # Calculate half-widths at top and tip
         half_width_top = top_width / 2  # 70µm
@@ -1002,10 +1013,15 @@ class ProbeDataExtractor:
         tip_apex_y = y_min - contact_height / 2 - tip_extension
         tip_apex_x = 0.0  # Center (H13 electrodes are centered)
 
-        # Build contour: trace left edge down (tapering inward), around tip, up right edge
         # Linear taper formula: at any Y, half_width = half_width_top - taper_rate * (shank_length - y)
-        # where taper_rate = (half_width_top - half_width_tip) / shank_length
+        # But we need to ensure all electrodes fit - use two-stage taper if necessary
+        # Stage 1: Linear taper from top to bottom electrode level (but not narrower than contacts need)
+        # Stage 2: Continue taper to tip (below electrodes, can be as narrow as specified)
+
         taper_rate = (half_width_top - half_width_tip) / shank_length_um
+
+        # Check if linear taper would be too narrow at electrode level
+        half_width_at_bottom_electrode = half_width_top - taper_rate * (shank_length_um - y_min)
 
         contour_points = []
 
@@ -1023,6 +1039,12 @@ class ProbeDataExtractor:
             # Calculate width at this Y position
             distance_from_top = shank_length_um - y
             half_width_at_y = half_width_top - taper_rate * distance_from_top
+
+            # Ensure width is sufficient to contain electrodes at this Y level
+            # Only apply minimum at electrode Y levels
+            if y >= y_min and half_width_at_y < min_half_width_for_contacts:
+                half_width_at_y = min_half_width_for_contacts
+
             contour_points.append((-half_width_at_y, float(y)))
 
         # Tip apex
@@ -1032,6 +1054,11 @@ class ProbeDataExtractor:
         for y in reversed(y_samples):
             distance_from_top = shank_length_um - y
             half_width_at_y = half_width_top - taper_rate * distance_from_top
+
+            # Ensure width is sufficient to contain electrodes at this Y level
+            if y >= y_min and half_width_at_y < min_half_width_for_contacts:
+                half_width_at_y = min_half_width_for_contacts
+
             contour_points.append((half_width_at_y, float(y)))
 
         # Top edge: end at top-right
@@ -1983,7 +2010,9 @@ class ProbeDataExtractor:
                 # Update the dict with extended contours (for sanity checks)
                 contours_dict[probe_name] = extended_df
 
-                extended_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                # Remove shank_length_mm column before writing (probeinterface expects only x, y)
+                output_df = extended_df[["x", "y"]].copy() if "x" in extended_df.columns else extended_df
+                output_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
     def _detect_shank_ids_from_positions(
         self, x_positions: List[float], shank_spacing_threshold: float = 100.0
