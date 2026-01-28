@@ -21,6 +21,8 @@ import numpy as np
 import pandas as pd
 
 from contact_id_mapper import ContactIdMapper
+from geometry_database import ProbeGeometryDatabase
+from contour_utils import reorder_contour_for_multi_shank, validate_contour
 
 
 def setup_logging(script_name: str) -> logging.Logger:
@@ -133,6 +135,15 @@ class ProbeDataExtractor:
             self.contact_id_mapper = ContactIdMapper(contact_id_excel_path)
             logger.info("Loaded contact ID mapper from Excel")
 
+        # Load probe geometry database from XML
+        xml_path = Path(__file__).parent / "references" / "probe_geometry_database.xml"
+        if xml_path.exists():
+            self.geometry_db: Optional[ProbeGeometryDatabase] = ProbeGeometryDatabase(xml_path)
+            logger.info(f"Loaded probe geometry database from {xml_path}")
+        else:
+            self.geometry_db = None
+            logger.warning(f"Probe geometry database not found at {xml_path}")
+
     def _load_database(self) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Load shank thickness and length from CSV database."""
         df = pd.read_csv(self.database_path)
@@ -164,6 +175,7 @@ class ProbeDataExtractor:
             ASSY-325D-H7 -> H7
             ASSY-325D-E-1 -> E-1
             ASSY-325D-P-2 -> P-2
+            ASSY-350-H15_2 -> H15 (underscore variant stripped for database lookup)
         """
         parts = folder_name.split("-")
         # For names like ASSY-325D-E-1, take last 2 parts if last is digit
@@ -171,7 +183,12 @@ class ProbeDataExtractor:
             return "-".join(parts[-2:])
         # For names like ASSY-325D-H7, take last part
         elif len(parts) >= 1:
-            return parts[-1]
+            probe_type = parts[-1]
+            # Handle underscore variants like H15_2 -> H15
+            # This strips the variant suffix for database lookups
+            if "_" in probe_type:
+                probe_type = probe_type.split("_")[0]
+            return probe_type
         return folder_name
 
     def _get_shank_thickness(self, probe_name: str) -> Optional[float]:
@@ -282,6 +299,26 @@ class ProbeDataExtractor:
             # Extract contact positions
             contact_positions = probe_obj.get("contact_positions", [])
 
+            # FIX: H15 source data has wrong inter-shank spacing (~150µm instead of 500µm)
+            # Correct by shifting shank 1 electrodes to achieve proper 500µm spacing
+            probe_type = self._get_probe_type_from_folder(probe_name)
+            if probe_type == "H15" and contact_positions:
+                # H15 specs: 500µm center-to-center spacing, 76µm shank width
+                # Shank 0 electrodes: X = 0-23µm (center ~11.5µm)
+                # Shank 1 electrodes: X = 150-173µm (center ~161.5µm) - WRONG
+                # Need to shift shank 1 to center at 511.5µm (11.5 + 500)
+                # Shift amount: 511.5 - 161.5 = 350µm
+                h15_shift = 350.0
+                corrected_positions = []
+                for pos in contact_positions:
+                    x, y = pos[0], pos[1]
+                    # Shank 1 electrodes have X >= 100µm in source data
+                    if x >= 100.0:
+                        x += h15_shift
+                    corrected_positions.append([x, y])
+                contact_positions = corrected_positions
+                logger.info(f"{probe_name}: Applied H15 spacing correction (+{h15_shift}µm to shank 1)")
+
             # Handle contact_ids - might be list or might not exist
             contact_ids_raw = probe_obj.get("contact_ids", None)
             device_channels = probe_obj.get("device_channel_indices", [])
@@ -298,13 +335,10 @@ class ProbeDataExtractor:
                     )
 
                     # Check for missing channels and warn
-                    missing_channels = [
-                        ch for ch in device_channels if ch not in channel_to_id
-                    ]
+                    missing_channels = [ch for ch in device_channels if ch not in channel_to_id]
                     if missing_channels:
                         logger.warning(
-                            f"Missing Excel mappings for {probe_name}: "
-                            f"channels {missing_channels}"
+                            f"Missing Excel mappings for {probe_name}: channels {missing_channels}"
                         )
 
                     # Map each position's device channel to its contact ID
@@ -328,43 +362,56 @@ class ProbeDataExtractor:
                     )
                 else:
                     # Fallback to sequential IDs
-                    contact_ids = list(range(
-                        contact_id_offset + 1,
-                        contact_id_offset + 1 + len(contact_positions)
-                    ))
+                    contact_ids = list(
+                        range(contact_id_offset + 1, contact_id_offset + 1 + len(contact_positions))
+                    )
             elif isinstance(contact_ids_raw, list):
                 # For non-dual-sided probes, use JSON contact_ids if available
                 if probe_idx > 0:
                     contact_ids = [int(cid) + contact_id_offset for cid in contact_ids_raw]
                 else:
                     contact_ids = [
-                        int(cid) if isinstance(cid, str) else cid
-                        for cid in contact_ids_raw
+                        int(cid) if isinstance(cid, str) else cid for cid in contact_ids_raw
                     ]
             else:
                 # Fallback: Generate sequential contact IDs
-                contact_ids = list(range(
-                    contact_id_offset + 1,
-                    contact_id_offset + 1 + len(contact_positions)
-                ))
+                contact_ids = list(
+                    range(contact_id_offset + 1, contact_id_offset + 1 + len(contact_positions))
+                )
 
             # Get contact shapes and dimensions
+            # First, determine correct defaults from XML database based on probe type
+            probe_type_for_dims = self._get_probe_type_from_folder(probe_name)
+            if self.geometry_db:
+                default_width, default_height, default_shape = (
+                    self.geometry_db.get_contact_dimensions(probe_type_for_dims)
+                )
+            else:
+                # Fallback: standard 12×12 square (not E-series 11×15)
+                default_width, default_height, default_shape = 12.0, 12.0, "square"
+
             contact_shapes = probe_obj.get("contact_shapes", None)
             if not isinstance(contact_shapes, list):
-                contact_shapes = ["circle"] * len(contact_positions)
+                contact_shapes = [default_shape] * len(contact_positions)
 
             shape_params = probe_obj.get("contact_shape_params", [])
             if isinstance(shape_params, list) and len(shape_params) > 0:
                 # List of dicts format: [{"width": 5, "height": 5}, ...]
-                widths = [p.get("width", 11) if isinstance(p, dict) else 11 for p in shape_params]
-                heights = [p.get("height", 15) if isinstance(p, dict) else 15 for p in shape_params]
+                widths = [
+                    p.get("width", default_width) if isinstance(p, dict) else default_width
+                    for p in shape_params
+                ]
+                heights = [
+                    p.get("height", default_height) if isinstance(p, dict) else default_height
+                    for p in shape_params
+                ]
             elif isinstance(shape_params, dict):
                 # Dict with lists format: {"width": [5, 5, ...], "height": [5, 5, ...]}
-                widths = shape_params.get("width", [11] * len(contact_positions))
-                heights = shape_params.get("height", [15] * len(contact_positions))
+                widths = shape_params.get("width", [default_width] * len(contact_positions))
+                heights = shape_params.get("height", [default_height] * len(contact_positions))
             else:
-                widths = [11] * len(contact_positions)
-                heights = [15] * len(contact_positions)
+                widths = [default_width] * len(contact_positions)
+                heights = [default_height] * len(contact_positions)
 
             # Get shank IDs if available
             shank_ids_raw = probe_obj.get("shank_ids", None)
@@ -377,33 +424,45 @@ class ProbeDataExtractor:
             for i, pos in enumerate(contact_positions):
                 x = pos[0]
 
-                # For dual-sided probes: y is vertical position, z represents the side (depth)
-                # For single-sided probes: y is vertical, z is shank thickness (negative)
-                if is_dual and thickness is not None:
-                    # For dual-sided probes with known thickness
-                    # y = vertical position along shank (from JSON z coordinate)
-                    y = pos[2] if len(pos) > 2 else 0.0
-                    # z = side indicator (front=negative, back=positive half-thickness)
-                    half_thickness = thickness / 2.0
-                    z = -half_thickness if side == "front" else half_thickness
+                # Handle both 2D and 3D coordinates from JSON
+                # For dual-sided probes: JSON has 3D [x, depth, height] where depth encodes side
+                # For single-sided probes: JSON has 2D [x, y]
+                if len(pos) >= 3:
+                    # 3D coordinates: JSON uses [x, depth, height_along_shank]
+                    # We need [x, height_along_shank, depth_centered_at_zero]
+                    y = pos[2]  # Height along shank is in JSON's Z position
+                    if is_dual and thickness is not None:
+                        # Center depth around 0: front = +thickness/2, back = -thickness/2
+                        z = (thickness / 2.0) if side == "front" else -(thickness / 2.0)
+                    else:
+                        # Single-sided: use JSON's Y (depth) value directly
+                        z = pos[1]
+                elif len(pos) >= 2:
+                    # 2D coordinates: [x, y]
+                    y = pos[1]
+                    if is_dual and thickness is not None:
+                        # For dual-sided probes, encode side in z
+                        z = (thickness / 2.0) if side == "front" else -(thickness / 2.0)
+                    else:
+                        # For single-sided probes, use negative thickness as depth indicator
+                        z = -thickness if thickness is not None else 0.0
                 else:
-                    # For single-sided probes, y is vertical position, z is shank thickness (negative)
-                    y = pos[1] if len(pos) > 1 else 0.0
-                    # Use negative shank thickness as z value for single-sided probes
-                    z = -thickness if thickness is not None else 0.0
+                    # Single coordinate: just x position
+                    y = 0.0
+                    z = 0.0
 
                 contact = {
-                    "contact_ids": str(contact_ids[i]) if i < len(contact_ids)
-                                  else str(i),
+                    "contact_ids": str(contact_ids[i]) if i < len(contact_ids) else str(i),
                     "x": x,
                     "y": y,
                     "z": z,
-                    "contact_shapes": contact_shapes[i] if i < len(contact_shapes)
-                                     else "circle",
-                    "width": widths[i] if i < len(widths) else 11,
-                    "height": heights[i] if i < len(heights) else 15,
+                    "contact_shapes": contact_shapes[i]
+                    if i < len(contact_shapes)
+                    else default_shape,
+                    "width": widths[i] if i < len(widths) else default_width,
+                    "height": heights[i] if i < len(heights) else default_height,
                     "shank_ids": str(shank_ids[i]) if i < len(shank_ids) else "",
-                    "contact_sides": side if side else ""
+                    "contact_sides": side if side else "",
                 }
                 all_contacts.append(contact)
 
@@ -422,9 +481,18 @@ class ProbeDataExtractor:
                         # For 3D contours, take x and z coordinates
                         # (y is the depth/side coordinate which stays constant for planar contours)
                         contours = [[p[0], p[2]] for p in contour_data]
-                        contour_columns = ["x", "y"]  # Column names in output (extracting x and z from 3D)
+                        contour_columns = [
+                            "x",
+                            "y",
+                        ]  # Column names in output (extracting x and z from 3D)
                     else:
                         contours = contour_data
+
+        # Reorder contour points for multi-shank probes to fix diagonal polygon fills
+        # This ensures contours trace continuously around each shank
+        if contours and all_contacts:
+            contact_positions = [[c["x"], c["y"]] for c in all_contacts]
+            contours = reorder_contour_for_multi_shank(contours, contact_positions)
 
         metadata = {
             "name": probe_name,
@@ -604,25 +672,513 @@ class ProbeDataExtractor:
 
         return result_df
 
+    def _compute_electrode_envelope(
+        self, positions: np.ndarray, margin: float = 8.0, y_tolerance: float = 10.0
+    ) -> List[Tuple[float, float, float]]:
+        """
+        Compute a SMOOTH linear taper envelope for E-series electrodes.
+
+        Instead of tracing each electrode level (which creates a zig-zag),
+        this computes the overall width at top vs bottom and creates a
+        linear taper that smoothly encompasses all electrodes.
+
+        Args:
+            positions: Nx2 array of (x, y) electrode positions
+            margin: Margin to add on each side (µm)
+            y_tolerance: Tolerance for grouping electrodes at same Y level (µm)
+
+        Returns:
+            List of (y, left_x, right_x) tuples for smooth linear taper
+        """
+        if len(positions) == 0:
+            return []
+
+        # Find overall bounds
+        y_min = float(np.min(positions[:, 1]))
+        y_max = float(np.max(positions[:, 1]))
+        x_center = float(np.mean(positions[:, 0]))
+
+        # Separate electrodes into top and bottom regions
+        y_range = y_max - y_min
+        top_threshold = y_max - y_range * 0.25  # Top 25% of electrodes
+        bottom_threshold = y_min + y_range * 0.25  # Bottom 25% of electrodes
+
+        top_positions = positions[positions[:, 1] >= top_threshold]
+        bottom_positions = positions[positions[:, 1] <= bottom_threshold]
+
+        # Calculate width at top and bottom
+        if len(top_positions) > 0:
+            top_x_min = float(np.min(top_positions[:, 0]))
+            top_x_max = float(np.max(top_positions[:, 0]))
+            top_width = top_x_max - top_x_min + 2 * margin
+            top_center = (top_x_min + top_x_max) / 2
+        else:
+            top_width = float(np.max(positions[:, 0]) - np.min(positions[:, 0])) + 2 * margin
+            top_center = x_center
+
+        if len(bottom_positions) > 0:
+            bottom_x_min = float(np.min(bottom_positions[:, 0]))
+            bottom_x_max = float(np.max(bottom_positions[:, 0]))
+            bottom_width = bottom_x_max - bottom_x_min + 2 * margin
+            bottom_center = (bottom_x_min + bottom_x_max) / 2
+        else:
+            bottom_width = top_width * 0.5  # Assume 50% taper if no bottom electrodes
+            bottom_center = x_center
+
+        # Ensure minimum width for electrodes
+        min_width = 2 * margin + 5  # At least margin on each side
+        top_width = max(top_width, min_width)
+        bottom_width = max(bottom_width, min_width)
+
+        # Create smooth linear taper with just 3 key points: top, middle, bottom
+        # This avoids the zig-zag while still following the V-pattern trend
+        envelope = []
+
+        # Top point
+        envelope.append((y_max, top_center - top_width / 2, top_center + top_width / 2))
+
+        # Middle point (50% of height)
+        mid_y = (y_max + y_min) / 2
+        mid_width = (top_width + bottom_width) / 2
+        mid_center = (top_center + bottom_center) / 2
+        envelope.append((mid_y, mid_center - mid_width / 2, mid_center + mid_width / 2))
+
+        # Bottom point
+        envelope.append((y_min, bottom_center - bottom_width / 2, bottom_center + bottom_width / 2))
+
+        # Validate: ensure ALL electrodes fit within the envelope at each Y level
+        # If any electrode is outside, expand locally
+        for pos in positions:
+            x, y = pos
+            # Find interpolated width at this Y level
+            if y >= mid_y:
+                # Between top and mid
+                t = (y_max - y) / (y_max - mid_y) if (y_max - mid_y) > 0 else 0
+                interp_left = (1 - t) * envelope[0][1] + t * envelope[1][1]
+                interp_right = (1 - t) * envelope[0][2] + t * envelope[1][2]
+            else:
+                # Between mid and bottom
+                t = (mid_y - y) / (mid_y - y_min) if (mid_y - y_min) > 0 else 0
+                interp_left = (1 - t) * envelope[1][1] + t * envelope[2][1]
+                interp_right = (1 - t) * envelope[1][2] + t * envelope[2][2]
+
+            # Check if electrode fits with margin
+            contact_left = x - margin
+            contact_right = x + margin
+
+            if contact_left < interp_left or contact_right > interp_right:
+                # Electrode would be outside - need to expand envelope
+                # Find which envelope point is closest and expand it
+                if y >= mid_y:
+                    # Expand top or mid point
+                    if abs(y - y_max) < abs(y - mid_y):
+                        envelope[0] = (envelope[0][0], min(envelope[0][1], contact_left),
+                                       max(envelope[0][2], contact_right))
+                    else:
+                        envelope[1] = (envelope[1][0], min(envelope[1][1], contact_left),
+                                       max(envelope[1][2], contact_right))
+                else:
+                    # Expand mid or bottom point
+                    if abs(y - mid_y) < abs(y - y_min):
+                        envelope[1] = (envelope[1][0], min(envelope[1][1], contact_left),
+                                       max(envelope[1][2], contact_right))
+                    else:
+                        envelope[2] = (envelope[2][0], min(envelope[2][1], contact_left),
+                                       max(envelope[2][2], contact_right))
+
+        return envelope
+
+    def _generate_e_series_single_shank_contour(
+        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame, probe_name: str
+    ) -> pd.DataFrame:
+        """
+        Generate E-series contour with 3-STAGE SYMMETRIC TAPER.
+
+        E-series contour shape (ref: E_probe_layout.png):
+        - STAGE 1: VERTICAL walls from top to 3rd highest electrode
+        - STAGE 2: WEAK TAPER from 3rd highest to 2nd lowest electrode
+        - STAGE 3: STRONG TAPER from 2nd lowest electrode to tip (25µm)
+
+        Args:
+            contour_df: DataFrame with x, y columns and shank_length_mm
+            contacts_df: DataFrame with contact positions
+            probe_name: Probe name for logging
+
+        Returns:
+            E-series contour DataFrame with x, y columns
+        """
+        if contour_df.empty or contacts_df is None or contacts_df.empty:
+            return contour_df
+
+        # Get shank length
+        if "shank_length_mm" not in contour_df.columns:
+            return contour_df
+        shank_length_mm = contour_df["shank_length_mm"].iloc[0]
+        if pd.isna(shank_length_mm):
+            return contour_df
+        shank_length_um = shank_length_mm * 1000
+
+        # Get contact dimensions (E-series: 11x15µm rectangular)
+        contact_width = 11.0
+        contact_height = 15.0
+        if "width" in contacts_df.columns:
+            contact_width = contacts_df["width"].max()
+        if "height" in contacts_df.columns:
+            contact_height = contacts_df["height"].max()
+
+        # E-series tip specs
+        tip_extension = 70  # µm below lowest electrode
+        tip_width = 25  # µm (from XML database)
+
+        # Margin for electrodes (half contact width + buffer)
+        margin = contact_width / 2 + 5
+
+        # Get contact positions
+        positions = contacts_df[["x", "y"]].values
+
+        # Find SHANK CENTER (for symmetric contour)
+        x_min_global = float(np.min(positions[:, 0]))
+        x_max_global = float(np.max(positions[:, 0]))
+        shank_center = (x_min_global + x_max_global) / 2
+
+        # Find unique Y levels (sorted low to high)
+        unique_y = sorted(set(positions[:, 1]))
+        n_levels = len(unique_y)
+
+        # Stage boundaries based on electrode Y levels
+        # Stage 1 ends at 3rd highest electrode
+        # Stage 2 ends at LOWEST electrode (not 2nd lowest!) to ensure all electrodes fit
+        if n_levels >= 4:
+            stage1_end_y = unique_y[-3]  # 3rd from top (where taper starts)
+            stage2_end_y = unique_y[0]   # LOWEST electrode (stage 3 is tip only)
+        elif n_levels >= 2:
+            # Fewer electrodes - split at middle
+            mid_idx = n_levels // 2
+            stage1_end_y = unique_y[mid_idx]
+            stage2_end_y = unique_y[0]  # LOWEST electrode
+        else:
+            # Single electrode - no taper stages
+            stage1_end_y = unique_y[0]
+            stage2_end_y = unique_y[0]
+
+        # Helper to get width at a Y level from electrode positions
+        def get_half_width_at_y(y_level: float) -> float:
+            """Get half-width at a specific Y level based on electrode positions."""
+            # Find electrodes at or near this Y level
+            tolerance = contact_height  # Within one contact height
+            mask = np.abs(positions[:, 1] - y_level) <= tolerance
+            if np.any(mask):
+                x_at_level = positions[mask, 0]
+                half_span = np.max(np.abs(x_at_level - shank_center))
+                return half_span + margin
+            # Fallback to global span
+            return (x_max_global - x_min_global) / 2 + margin
+
+        # Calculate widths at stage boundaries
+        # Stage 1: Full width at top (widest)
+        half_width_top = get_half_width_at_y(unique_y[-1])  # Top electrode level
+
+        # Stage 2 start: Same as stage 1 end (width at 3rd highest electrode)
+        half_width_stage2_start = get_half_width_at_y(stage1_end_y)
+
+        # Stage 2 end: Width must accommodate ALL electrodes below stage 2
+        # This includes the 2nd lowest AND lowest electrodes
+        # Calculate based on the WIDEST electrode span in the bottom 2 levels
+        bottom_levels = unique_y[:2] if n_levels >= 2 else unique_y
+        bottom_mask = np.isin(positions[:, 1], bottom_levels)
+        if np.any(bottom_mask):
+            bottom_positions = positions[bottom_mask]
+            bottom_half_span = np.max(np.abs(bottom_positions[:, 0] - shank_center))
+            half_width_stage2_end = bottom_half_span + margin
+        else:
+            half_width_stage2_end = get_half_width_at_y(stage2_end_y)
+
+        # Stage 3 end: Tip width
+        half_width_tip = tip_width / 2
+
+        # Key Y positions
+        top_y = shank_length_um  # Top of shank
+        y_min = float(np.min(positions[:, 1]))
+        tip_y = y_min - contact_height / 2 - tip_extension  # Tip apex
+
+        # Adjust Y positions for contour (bottom of electrodes at each level)
+        stage1_end_contour_y = stage1_end_y - contact_height / 2
+        stage2_end_contour_y = stage2_end_y - contact_height / 2
+
+        # Build 3-STAGE CONTOUR (clockwise from top-left)
+        contour_points = [
+            # STAGE 1: Vertical (left side, top to stage1_end)
+            (shank_center - half_width_top, top_y),                    # Top-left
+            (shank_center - half_width_stage2_start, stage1_end_contour_y),  # Stage 1/2 boundary left
+
+            # STAGE 2: Weak taper (left side continues down)
+            (shank_center - half_width_stage2_end, stage2_end_contour_y),    # Stage 2/3 boundary left
+
+            # STAGE 3: Strong taper to tip
+            (shank_center, tip_y),                                     # Tip apex (centered)
+
+            # STAGE 3: Strong taper (right side going up)
+            (shank_center + half_width_stage2_end, stage2_end_contour_y),    # Stage 2/3 boundary right
+
+            # STAGE 2: Weak taper (right side continues up)
+            (shank_center + half_width_stage2_start, stage1_end_contour_y),  # Stage 1/2 boundary right
+
+            # STAGE 1: Vertical (right side, stage1_end to top)
+            (shank_center + half_width_top, top_y),                    # Top-right
+        ]
+
+        x_col = "x" if "x" in contour_df.columns else contour_df.columns[0]
+        y_col = "y" if "y" in contour_df.columns else contour_df.columns[1]
+
+        result_df = pd.DataFrame(contour_points, columns=[x_col, y_col])
+
+        # Preserve shank_length_mm if present
+        if "shank_length_mm" in contour_df.columns:
+            result_df["shank_length_mm"] = shank_length_mm
+
+        logger.debug(
+            f"{probe_name}: E-series 3-STAGE contour - "
+            f"top_width={half_width_top*2:.0f}µm, stage2_end_width={half_width_stage2_end*2:.0f}µm, "
+            f"tip_width={tip_width}µm"
+        )
+
+        return result_df
+
+    def _generate_h13_tapered_shank_contour(
+        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame, probe_name: str
+    ) -> pd.DataFrame:
+        """
+        Generate a full-shank tapered contour for H13 probes.
+
+        H13 has a LINEAR TAPER from 140µm at top to 20µm at tip over 8mm shank length.
+        This is different from E-series where only the tip tapers below electrodes.
+        The entire shank tapers continuously, and electrode X positions vary with Y.
+
+        Args:
+            contour_df: DataFrame with x, y columns and shank_length_mm
+            contacts_df: DataFrame with contact positions
+            probe_name: Probe name for logging
+
+        Returns:
+            Tapered contour DataFrame with x, y columns
+        """
+        if contour_df.empty or contacts_df is None or contacts_df.empty:
+            return contour_df
+
+        # Get shank dimensions from XML database or use defaults
+        if self.geometry_db:
+            top_width = self.geometry_db.get_shank_width("H13", "top") or 140.0
+            tip_width = self.geometry_db.get_shank_width("H13", "tip") or 20.0
+            tip_extension = self.geometry_db.get_tip_extension("H13") or 20
+        else:
+            top_width = 140.0  # µm at top
+            tip_width = 20.0  # µm at tip
+            tip_extension = 20  # µm below lowest electrode
+
+        # Get shank length
+        if "shank_length_mm" in contour_df.columns:
+            shank_length_mm = contour_df["shank_length_mm"].iloc[0]
+            if pd.isna(shank_length_mm):
+                shank_length_mm = 8.0  # Default H13 shank length
+        else:
+            shank_length_mm = 8.0
+
+        shank_length_um = shank_length_mm * 1000
+
+        # Get contact dimensions for margin calculation
+        contact_height = 12.0  # Default
+        if "height" in contacts_df.columns:
+            contact_height = contacts_df["height"].max()
+
+        # Get contact bounds
+        positions = contacts_df[["x", "y"]].values
+        y_min = float(np.min(positions[:, 1]))
+
+        # Calculate half-widths at top and tip
+        half_width_top = top_width / 2  # 70µm
+        half_width_tip = tip_width / 2  # 10µm
+
+        # Tip apex position
+        tip_apex_y = y_min - contact_height / 2 - tip_extension
+        tip_apex_x = 0.0  # Center (H13 electrodes are centered)
+
+        # Build contour: trace left edge down (tapering inward), around tip, up right edge
+        # Linear taper formula: at any Y, half_width = half_width_top - taper_rate * (shank_length - y)
+        # where taper_rate = (half_width_top - half_width_tip) / shank_length
+        taper_rate = (half_width_top - half_width_tip) / shank_length_um
+
+        contour_points = []
+
+        # Top edge: start at top-left
+        contour_points.append((-half_width_top, shank_length_um))
+
+        # Left edge: taper down - sample points for smooth taper
+        # Sample every 200µm for smooth curve
+        y_samples = np.arange(shank_length_um, y_min - 10, -200)
+        # Ensure we include the point just above the tip
+        if y_samples[-1] > y_min - 10:
+            y_samples = np.append(y_samples, y_min - 10)
+
+        for y in y_samples:
+            # Calculate width at this Y position
+            distance_from_top = shank_length_um - y
+            half_width_at_y = half_width_top - taper_rate * distance_from_top
+            contour_points.append((-half_width_at_y, float(y)))
+
+        # Tip apex
+        contour_points.append((tip_apex_x, tip_apex_y))
+
+        # Right edge: taper up (reverse order)
+        for y in reversed(y_samples):
+            distance_from_top = shank_length_um - y
+            half_width_at_y = half_width_top - taper_rate * distance_from_top
+            contour_points.append((half_width_at_y, float(y)))
+
+        # Top edge: end at top-right
+        contour_points.append((half_width_top, shank_length_um))
+
+        # Get column names
+        x_col = "x" if "x" in contour_df.columns else contour_df.columns[0]
+        y_col = "y" if "y" in contour_df.columns else contour_df.columns[1]
+
+        result_df = pd.DataFrame(contour_points, columns=[x_col, y_col])
+
+        logger.debug(
+            f"{probe_name}: Generated H13 tapered contour, "
+            f"width {top_width:.0f}µm (top) → {tip_width:.0f}µm (tip)"
+        )
+
+        return result_df
+
+    def _generate_m_series_contour(
+        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame, probe_name: str
+    ) -> pd.DataFrame:
+        """
+        Generate a 2-stage ASYMMETRIC contour for M-series (large animal) probes.
+
+        M-series probes have:
+        - Fixed 140µm shank width
+        - 70µm shank thickness
+        - 2-stage ASYMMETRIC taper:
+          Stage 1: Both sides vertical until taper start Y level
+          Stage 2: Left stays vertical, right tapers to tip (tip at LEFT edge)
+
+        Taper start Y level:
+        - M1, M3: 3rd row of sites from bottom
+        - M2: 5th site from bottom
+
+        Args:
+            contour_df: DataFrame with x, y columns and shank_length_mm
+            contacts_df: DataFrame with contact positions
+            probe_name: Probe name for logging
+
+        Returns:
+            M-series contour DataFrame with x, y columns
+        """
+        if contour_df.empty or contacts_df is None or contacts_df.empty:
+            return contour_df
+
+        # M-series fixed dimensions
+        shank_width = 140.0  # µm - fixed width for all M-series
+        tip_extension = 50  # µm below lowest electrode
+
+        # Determine probe type for taper start
+        probe_type = self._get_probe_type_from_folder(probe_name) if probe_name else None
+        is_m2 = probe_type and "M2" in probe_type
+
+        # Get shank length
+        if "shank_length_mm" in contour_df.columns:
+            shank_length_mm = contour_df["shank_length_mm"].iloc[0]
+            if pd.isna(shank_length_mm):
+                shank_length_mm = 6.5  # Default M-series shank length
+        else:
+            shank_length_mm = 6.5
+
+        shank_length_um = shank_length_mm * 1000
+
+        # Get contact dimensions
+        contact_height = 12.0  # Default
+        if "height" in contacts_df.columns:
+            contact_height = contacts_df["height"].max()
+
+        # Get contact bounds and unique Y levels
+        positions = contacts_df[["x", "y"]].values
+        y_min = float(np.min(positions[:, 1]))
+        unique_y = sorted(set(positions[:, 1]))  # Sorted low to high
+
+        # Center the shank on the electrode center
+        contact_center_x = (float(np.min(positions[:, 0])) + float(np.max(positions[:, 0]))) / 2
+
+        # Calculate half-width
+        half_width = shank_width / 2  # 70µm
+
+        # Determine taper start Y level
+        # M1, M3: 3rd row from bottom (index 2)
+        # M2: 5th site from bottom (index 4)
+        if is_m2:
+            taper_start_idx = min(4, len(unique_y) - 1)
+        else:
+            taper_start_idx = min(2, len(unique_y) - 1)
+
+        taper_start_y = unique_y[taper_start_idx] - contact_height / 2
+
+        # Left edge stays at left throughout (ASYMMETRIC - tip at LEFT edge)
+        left_edge_x = contact_center_x - half_width
+        right_edge_x = contact_center_x + half_width
+
+        # Tip apex position - at LEFT edge (asymmetric)
+        tip_apex_y = y_min - contact_height / 2 - tip_extension
+        tip_apex_x = left_edge_x  # Tip at LEFT edge
+
+        # Build 2-stage ASYMMETRIC contour
+        # Stage 1: Both sides vertical from top to taper_start_y
+        # Stage 2: Left stays vertical, right tapers to meet at tip (LEFT edge)
+        contour_points = [
+            (left_edge_x, shank_length_um),      # Top-left
+            (left_edge_x, taper_start_y),        # Stage 1/2 boundary left (still vertical)
+            (left_edge_x, tip_apex_y),           # Tip at LEFT edge (left stayed vertical)
+            (right_edge_x, taper_start_y),       # Stage 1/2 boundary right (taper starts here)
+            (right_edge_x, shank_length_um),     # Top-right
+        ]
+
+        # Get column names
+        x_col = "x" if "x" in contour_df.columns else contour_df.columns[0]
+        y_col = "y" if "y" in contour_df.columns else contour_df.columns[1]
+
+        result_df = pd.DataFrame(contour_points, columns=[x_col, y_col])
+
+        # Preserve shank_length_mm if present
+        if "shank_length_mm" in contour_df.columns:
+            result_df["shank_length_mm"] = shank_length_mm
+
+        logger.debug(
+            f"{probe_name}: Generated M-series 2-stage asymmetric contour, "
+            f"width={shank_width:.0f}µm, taper_start_y={taper_start_y:.0f}µm, "
+            f"tip at LEFT edge ({tip_apex_x:.0f}, {tip_apex_y:.0f})"
+        )
+
+        return result_df
+
     def _extend_multishank_contour(
         self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame = None, probe_name: str = None
     ) -> pd.DataFrame:
         """
-        Extend multi-shank contour so each shank extends to near full length.
+        Generate a proper multi-shank contour from scratch based on contact positions.
 
-        For multi-shank probes, extends each individual shank from its current
-        top up to near the shank length, with all shanks merging at the very top.
+        This completely regenerates the contour to ensure proper shank separation.
+        Each shank is traced individually (down left, around tip, up right), with
+        horizontal bridges at the top connecting shanks. No diagonal fills.
 
         IMPORTANT: This function uses tip_length from a database based on probe type
         to ensure consistent tip depths regardless of source JSON quality.
 
         Args:
             contour_df: DataFrame with x, y columns and shank_length_mm
-            contacts_df: Optional DataFrame with contact positions and dimensions
+            contacts_df: DataFrame with contact positions and dimensions
             probe_name: Probe name to extract probe type for tip_length lookup
 
         Returns:
-            Extended contour DataFrame with individual shanks extended
+            New contour DataFrame with proper shank separation
         """
         if contour_df.empty or "shank_length_mm" not in contour_df.columns:
             return contour_df[["x", "y"]].copy() if "x" in contour_df.columns else contour_df
@@ -632,226 +1188,603 @@ class ProbeDataExtractor:
             return contour_df[["x", "y"]].copy() if "x" in contour_df.columns else contour_df
 
         shank_length_um = shank_length_mm * 1000
-        merge_height = 200  # Height of merged section at top (µm)
-        shank_top = shank_length_um - merge_height  # Where individual shanks extend to
+        merge_height = 200  # Height above shank length where merged section extends (µm)
+        shank_top = shank_length_um  # Individual shanks extend to full shank length
+        merge_top = shank_length_um + merge_height  # Merged section extends 200µm above shank length
+
+        # IMPORTANT: Ensure shank_top is ABOVE all contacts
+        # Some probes (e.g., H15_2) have contacts near the top, causing them to appear
+        # in the shared area between shanks if connection height is too low
+        if contacts_df is not None and "y" in contacts_df.columns and len(contacts_df) > 0:
+            global_max_y = contacts_df["y"].max()
+            min_shank_top = global_max_y + 50  # At least 50µm above highest contact
+            if shank_top < min_shank_top:
+                logger.debug(
+                    f"Adjusting shank_top from {shank_top:.0f} to {min_shank_top:.0f} "
+                    f"to stay above contacts (max_y={global_max_y:.0f})"
+                )
+                shank_top = min_shank_top
+                # Recalculate merge_top to maintain 200µm above adjusted shank_top
+                merge_top = shank_top + merge_height
 
         # Get contact half-width for expanding contour bounds
         contact_margin = 2.0  # Additional margin in µm
+        half_width = contact_margin
+        contact_height = 15.0
         if contacts_df is not None and "width" in contacts_df.columns:
             half_width = contacts_df["width"].max() / 2.0 + contact_margin
-        else:
-            half_width = contact_margin
+        if contacts_df is not None and "height" in contacts_df.columns:
+            contact_height = contacts_df["height"].max()
+
+        # Validate/expand width against XML database shank width
+        if self.geometry_db and probe_name:
+            probe_type = self._get_probe_type_from_folder(probe_name)
+            expected_shank_width = self.geometry_db.get_shank_width(probe_type, "top")
+            if expected_shank_width:
+                expected_half_width = expected_shank_width / 2
+                calculated_width = half_width * 2  # Convert back to full width
+                if calculated_width < expected_shank_width:
+                    # Calculated width is narrower than expected - use expected
+                    half_width = expected_half_width + contact_margin
+                    logger.debug(
+                        f"{probe_name}: Expanded contour width from {calculated_width:.0f}µm "
+                        f"to {expected_shank_width:.0f}µm (from XML)"
+                    )
+                elif calculated_width > expected_shank_width * 1.5:
+                    # Calculated width is much wider than expected - warn
+                    logger.warning(
+                        f"{probe_name}: Calculated width {calculated_width:.0f}µm is much wider "
+                        f"than expected {expected_shank_width:.0f}µm (from XML)"
+                    )
 
         x_col = "x" if "x" in contour_df.columns else contour_df.columns[0]
         y_col = "y" if "y" in contour_df.columns else contour_df.columns[1]
 
-        x_values = contour_df[x_col].values.astype(float)
-        y_values = contour_df[y_col].values.astype(float)
+        # Detect probe type early for shank detection strategy
+        early_probe_type = None
+        if probe_name:
+            early_probe_type = self._get_probe_type_from_folder(probe_name)
+        early_is_e_series = early_probe_type and early_probe_type.startswith("E")
 
-        current_max_y = np.max(y_values)
-        current_min_y = np.min(y_values)  # The tip apex Y from original contour
-
-        # If already extended, just return
-        if current_max_y >= shank_length_um:
-            return contour_df[[x_col, y_col]].copy()
-
-        # Detect shanks from contact positions (most reliable)
+        # Detect shanks - prefer using shank_ids from contacts if available
+        # EXCEPTION: For E-series, ALWAYS use X-gap detection because shank_ids may be
+        # assigned per-electrode-column instead of per-physical-shank, causing narrow contours
         shanks = []
         if contacts_df is not None and "x" in contacts_df.columns and len(contacts_df) > 0:
-            contact_x_values = sorted(contacts_df["x"].unique())
-            if len(contact_x_values) > 0:
-                x_diffs = np.diff(contact_x_values)
-                gap_threshold = 60  # Lower to detect H10/F8/H16 gaps (68-95µm)
-                gap_indices = np.where(x_diffs > gap_threshold)[0]
+            # Method 1: Use shank_ids if available (most accurate)
+            # Skip for E-series which needs X-gap detection to properly group both electrode columns
+            if "shank_ids" in contacts_df.columns and not early_is_e_series:
+                unique_shank_ids = contacts_df["shank_ids"].dropna().unique()
+                # Filter out empty strings
+                unique_shank_ids = [s for s in unique_shank_ids if s != ""]
+                if len(unique_shank_ids) > 1:
+                    for shank_id in sorted(unique_shank_ids):
+                        shank_contacts = contacts_df[contacts_df["shank_ids"] == shank_id]
+                        if len(shank_contacts) > 0:
+                            left_x = shank_contacts["x"].min()
+                            right_x = shank_contacts["x"].max()
+                            tip_x = (left_x + right_x) / 2
+                            min_contact_y = shank_contacts["y"].min()
+                            max_contact_y = shank_contacts["y"].max()
+                            shanks.append(
+                                {
+                                    "left": left_x,
+                                    "right": right_x,
+                                    "tip_x": tip_x,
+                                    "min_y": min_contact_y,
+                                    "max_y": max_contact_y,
+                                }
+                            )
+                    if early_is_e_series:
+                        logger.debug(f"{probe_name}: E-series - skipping shank_ids, using X-gap detection")
 
-                start_idx = 0
-                for gap_idx in gap_indices:
-                    shank_contacts_x = contact_x_values[start_idx:gap_idx + 1]
-                    left_x = min(shank_contacts_x)
-                    right_x = max(shank_contacts_x)
-                    tip_x = (left_x + right_x) / 2
-                    # Get min Y for this shank's contacts
-                    shank_contacts = contacts_df[
-                        (contacts_df["x"] >= left_x) & (contacts_df["x"] <= right_x)
-                    ]
-                    min_contact_y = shank_contacts["y"].min() if len(shank_contacts) > 0 else 0
-                    shanks.append((left_x, right_x, tip_x, min_contact_y))
-                    start_idx = gap_idx + 1
-                if start_idx < len(contact_x_values):
-                    shank_contacts_x = contact_x_values[start_idx:]
-                    left_x = min(shank_contacts_x)
-                    right_x = max(shank_contacts_x)
-                    tip_x = (left_x + right_x) / 2
-                    shank_contacts = contacts_df[
-                        (contacts_df["x"] >= left_x) & (contacts_df["x"] <= right_x)
-                    ]
-                    min_contact_y = shank_contacts["y"].min() if len(shank_contacts) > 0 else 0
-                    shanks.append((left_x, right_x, tip_x, min_contact_y))
+            # Method 2: Fall back to X-gap detection if shank_ids not available or E-series
+            if not shanks:
+                contact_x_values = sorted(contacts_df["x"].unique())
+                if len(contact_x_values) > 0:
+                    x_diffs = np.diff(contact_x_values)
+                    gap_threshold = 100  # Increased to avoid splitting E-series columns (70µm)
+                    gap_indices = np.where(x_diffs > gap_threshold)[0]
+
+                    start_idx = 0
+                    for gap_idx in gap_indices:
+                        shank_contacts_x = contact_x_values[start_idx : gap_idx + 1]
+                        left_x = min(shank_contacts_x)
+                        right_x = max(shank_contacts_x)
+                        tip_x = (left_x + right_x) / 2
+                        shank_contacts = contacts_df[
+                            (contacts_df["x"] >= left_x) & (contacts_df["x"] <= right_x)
+                        ]
+                        min_contact_y = shank_contacts["y"].min() if len(shank_contacts) > 0 else 0
+                        max_contact_y = shank_contacts["y"].max() if len(shank_contacts) > 0 else 0
+                        shanks.append(
+                            {
+                                "left": left_x,
+                                "right": right_x,
+                                "tip_x": tip_x,
+                                "min_y": min_contact_y,
+                                "max_y": max_contact_y,
+                            }
+                        )
+                        start_idx = gap_idx + 1
+                    if start_idx < len(contact_x_values):
+                        shank_contacts_x = contact_x_values[start_idx:]
+                        left_x = min(shank_contacts_x)
+                        right_x = max(shank_contacts_x)
+                        tip_x = (left_x + right_x) / 2
+                        shank_contacts = contacts_df[
+                            (contacts_df["x"] >= left_x) & (contacts_df["x"] <= right_x)
+                        ]
+                        min_contact_y = shank_contacts["y"].min() if len(shank_contacts) > 0 else 0
+                        max_contact_y = shank_contacts["y"].max() if len(shank_contacts) > 0 else 0
+                        shanks.append(
+                            {
+                                "left": left_x,
+                                "right": right_x,
+                                "tip_x": tip_x,
+                                "min_y": min_contact_y,
+                                "max_y": max_contact_y,
+                            }
+                        )
 
         if not shanks:
             return self._extend_contour_to_shank_length(contour_df, contacts_df)
 
         # Sort shanks by X position (left to right)
-        shanks = sorted(shanks, key=lambda s: s[2])
+        shanks = sorted(shanks, key=lambda s: s["tip_x"])
 
-        # Expand shank bounds by half_width to ensure contacts fit inside contour
-        shanks = [
-            (left - half_width, right + half_width, tip_x, min_y)
-            for left, right, tip_x, min_y in shanks
-        ]
-
-        # Tip length database based on Cambridge NeuroTech reference image
-        # tip_length = how far below lowest contact the apex extends
-        TIP_LENGTH_DB = {
-            "E": 70,      # E-type: 40 µm tip width, ~70 µm extension
-            "E-1": 70,
-            "E-2": 70,
-            "P": 70,      # P-type: 25 µm tip width, ~70 µm extension
-            "P-1": 70,
-            "P-2": 70,
-            "F": 50,      # F-type: 25 µm tip width, ~50 µm extension
-            "Fb": 50,
-            "H10": 50,    # H10: 30 µm tip width
-            "H6": 65,     # H6: 30 µm tip width
-            "H7": 65,     # H7: 50 µm tip width, longer tip
-            "H2": 28,     # H2: 25 µm tip width
-            "H3": 28,     # H3: 20 µm tip width
-            "H5": 30,     # H5: 25 µm tip width
-            "H8": 100,    # H8: 60 µm tip width, longer tip
-            "H9": 55,     # H9: 45 µm tip width
-            "L1": 28,     # L-series: 18 µm tip width
-            "L2": 28,
-            "L3": 28,
-            "M1": 50,     # M-series
-            "M2": 50,
-            "H1": 40,
-            "H4": 28,
-            "H12": 28,
-            "H13": 28,
-            "H14": 20,
-            "H15": 20,
-            "H16": 20,
-            "H20": 20,
-        }
-
-        # Get tip length for this probe type
+        # Get tip length and width for this probe type
+        # Priority: 1) XML database, 2) Fallback hardcoded dict
         tip_length = 50  # Default tip length
-
-        # Extract probe type from probe_name (e.g., "ASSY-77-E-1" -> "E-1")
+        tip_width = 0    # Default tip width (0 = sharp point)
         probe_type = None
         if probe_name:
             probe_type = self._get_probe_type_from_folder(probe_name)
 
         if probe_type:
-            # Try exact match first, then prefix match
-            if probe_type in TIP_LENGTH_DB:
-                tip_length = TIP_LENGTH_DB[probe_type]
+            # Try XML database first (most accurate source)
+            if self.geometry_db:
+                xml_tip_length = self.geometry_db.get_tip_extension(probe_type)
+                xml_tip_width = self.geometry_db.get_tip_width(probe_type)
+                if xml_tip_length is not None:
+                    tip_length = xml_tip_length
+                if xml_tip_width is not None:
+                    tip_width = xml_tip_width
+                    logger.debug(
+                        f"Probe {probe_name}: tip_length={tip_length}µm, tip_width={tip_width}µm (from XML)"
+                    )
+                else:
+                    # Fallback to hardcoded dict (updated values from XML)
+                    TIP_LENGTH_DB = {
+                        "E": 70,
+                        "E-1": 70,
+                        "E-2": 70,
+                        "P": 70,
+                        "P-1": 70,
+                        "P-2": 70,
+                        "F": 50,
+                        "Fb": 50,
+                        "F8": 15,
+                        "F8-0": 15,
+                        "F8-1": 15,
+                        "F8-2": 15,
+                        "H10": 50,
+                        "H10-1": 50,
+                        "H10-2": 50,
+                        "H6": 65,
+                        "H7": 65,
+                        "H2": 28,
+                        "H3": 28,
+                        "H5": 30,
+                        "H8": 100,
+                        "H9": 55,
+                        "L1": 28,
+                        "L2": 28,
+                        "L3": 28,
+                        "L13": 90,
+                        "L14": 50,
+                        "M1": 50,
+                        "M2": 50,
+                        "M3": 60,
+                        "H1": 40,
+                        "H4": 28,
+                        "H12": 26,
+                        "H13": 20,
+                        "H14": 25,
+                        "H15": 75,
+                        "H16": 25,
+                        "H20": 30,
+                    }
+                    if probe_type in TIP_LENGTH_DB:
+                        tip_length = TIP_LENGTH_DB[probe_type]
+                    else:
+                        for key in sorted(TIP_LENGTH_DB.keys(), key=len, reverse=True):
+                            if probe_type.startswith(key):
+                                tip_length = TIP_LENGTH_DB[key]
+                                break
+                    logger.debug(f"Probe {probe_name}: tip_length={tip_length}µm (from fallback)")
             else:
-                # Try to find a matching prefix (e.g., "E-1" matches "E")
-                for key in sorted(TIP_LENGTH_DB.keys(), key=len, reverse=True):
-                    if probe_type.startswith(key):
-                        tip_length = TIP_LENGTH_DB[key]
-                        break
+                # No XML database - use fallback dict
+                TIP_LENGTH_DB = {
+                    "E": 70,
+                    "E-1": 70,
+                    "E-2": 70,
+                    "P": 70,
+                    "P-1": 70,
+                    "P-2": 70,
+                    "F": 50,
+                    "Fb": 50,
+                    "F8": 15,
+                    "F8-0": 15,
+                    "F8-1": 15,
+                    "F8-2": 15,
+                    "H10": 50,
+                    "H10-1": 50,
+                    "H10-2": 50,
+                    "H6": 65,
+                    "H7": 65,
+                    "H2": 28,
+                    "H3": 28,
+                    "H5": 30,
+                    "H8": 100,
+                    "H9": 55,
+                    "L1": 28,
+                    "L2": 28,
+                    "L3": 28,
+                    "L13": 90,
+                    "L14": 50,
+                    "M1": 50,
+                    "M2": 50,
+                    "M3": 60,
+                    "H1": 40,
+                    "H4": 28,
+                    "H12": 26,
+                    "H13": 20,
+                    "H14": 25,
+                    "H15": 75,
+                    "H16": 25,
+                    "H20": 30,
+                }
+                if probe_type in TIP_LENGTH_DB:
+                    tip_length = TIP_LENGTH_DB[probe_type]
+                else:
+                    for key in sorted(TIP_LENGTH_DB.keys(), key=len, reverse=True):
+                        if probe_type.startswith(key):
+                            tip_length = TIP_LENGTH_DB[key]
+                            break
+                logger.debug(f"Probe {probe_name}: tip_length={tip_length}µm (no XML database)")
 
-        logger.debug(f"Probe {probe_name}: type={probe_type}, tip_length={tip_length}")
+        # Detect if this is an E-series probe (has tapered V-shaped shanks)
+        is_e_series = probe_type and probe_type.startswith("E")
 
-        # Calculate apex Y based on lowest contact and tip_length
-        # This ensures consistent tip depth regardless of source JSON quality
-        # Find the minimum contact Y across all shanks
-        if contacts_df is not None and "y" in contacts_df.columns and len(contacts_df) > 0:
-            global_min_contact_y = contacts_df["y"].min()
-            contact_height = 15
-            if "height" in contacts_df.columns:
-                contact_height = contacts_df["height"].max()
-            # Apex is tip_length below the lowest contact
-            apex_y = global_min_contact_y - contact_height / 2 - tip_length
+        # Detect if this is an L-series probe (ASYMMETRIC taper: left vertical, right tapers)
+        is_l_series = probe_type and probe_type.startswith("L") and probe_type in ("L13", "L14")
+
+        # Detect if this is an M-series probe (large animal, 140µm fixed shank width)
+        is_m_series = probe_type and probe_type.startswith("M") and probe_type in (
+            "M1", "M1v1", "M1v2", "M2", "M2v1", "M2v2", "M3"
+        )
+        m_series_shank_width = 140.0  # µm - fixed width for M-series
+
+        # ============================================================
+        # GENERATE MULTI-SHANK CONTOUR FROM SCRATCH
+        # ============================================================
+        # Strategy: Build a single polygon that traces around ALL shanks properly.
+        # The contour starts at top-left, goes down around first shank's tip,
+        # up to connection height, horizontal bridge to next shank, repeat,
+        # then closes at top-right and back to start.
+        #
+        # For E-series probes: Create smooth V-tapered contours where the shank
+        # width decreases from top to tip (straight diagonal lines from corners
+        # to tip apex - no rectangular walls). SYMMETRIC taper on both sides.
+        #
+        # For L-series probes: ASYMMETRIC taper where the LEFT side is vertical
+        # and the RIGHT side has two-stage taper. Tip is at left edge.
+        #
+        # For other probes: Rectangular walls with V-shaped tips only at bottom.
+        # ============================================================
+
+        new_points = []
+
+        # Get contact dimensions for margin calculation (needed for global bounds)
+        contact_width = 12.0  # Default
+        if contacts_df is not None and "width" in contacts_df.columns:
+            contact_width = contacts_df["width"].max()
+
+        # Global bounds for the merged top section
+        # Calculate per-shank width for first and last shanks
+        first_shank = shanks[0]
+        last_shank = shanks[-1]
+        first_center = (first_shank["left"] + first_shank["right"]) / 2
+        last_center = (last_shank["left"] + last_shank["right"]) / 2
+
+        # Per-shank width for first shank
+        first_span = first_shank["right"] - first_shank["left"]
+        first_required_half = first_span / 2 + contact_width / 2 + contact_margin
+        if is_m_series:
+            first_half_width = m_series_shank_width / 2
         else:
-            # Fallback to original contour minimum
-            apex_y = current_min_y
+            first_half_width = max(half_width, first_required_half)
 
-        # PRESERVE original contour shape (tapered geometry) and ADD straight walls above
-        # Strategy: Keep all original points, then add new points to extend straight up
-        # from the original top to the target shank length.
+        # Per-shank width for last shank
+        last_span = last_shank["right"] - last_shank["left"]
+        last_required_half = last_span / 2 + contact_width / 2 + contact_margin
+        if is_m_series:
+            last_half_width = m_series_shank_width / 2
+        else:
+            last_half_width = max(half_width, last_required_half)
 
-        # Find the original top Y (where straight walls should start)
-        original_top_y = current_max_y
+        global_left = first_center - first_half_width
+        global_right = last_center + last_half_width
 
-        # Overall bounds for the merged top section
-        min_x = min(x_values)
-        max_x = max(x_values)
+        # Start at top-left corner (200µm above shank length)
+        new_points.append((global_left, merge_top))
 
-        # Group points by shank (detect gaps in X)
-        # Sort points by X to identify shank boundaries
-        points_with_idx = [(x, y, i) for i, (x, y) in enumerate(zip(x_values, y_values))]
+        # Process each shank: down left edge, around V-tip, up right edge
+        for i, shank in enumerate(shanks):
+            # Calculate per-shank width to ensure ALL electrodes fit
+            # The shank bounds (left/right) are electrode CENTER positions
+            electrode_center = (shank["left"] + shank["right"]) / 2
+            shank_electrode_span = shank["right"] - shank["left"]
 
-        # Find the "top edge" X values for each shank (points at or near max Y)
-        top_edge_tolerance = 50  # Points within 50µm of max_y are considered "top edge"
-        top_edge_points = [(x, y) for x, y in zip(x_values, y_values)
-                          if y >= original_top_y - top_edge_tolerance]
+            # Required half-width = half electrode span + half contact width + margin
+            # This ensures contact edges don't extrude
+            required_half_width = shank_electrode_span / 2 + contact_width / 2 + contact_margin
 
-        # Build new contour: keep original shape, add extensions above
-        new_points = []
+            # M-series: Use fixed 140µm shank width (large animal probes)
+            if is_m_series:
+                per_shank_half_width = m_series_shank_width / 2
+            else:
+                # Use the larger of global half_width and per-shank required width
+                per_shank_half_width = max(half_width, required_half_width)
 
-        # Start with top-left corner at full shank length
-        new_points.append((min_x, shank_length_um))
+            left_x = electrode_center - per_shank_half_width
+            right_x = electrode_center + per_shank_half_width
+            tip_x = shank["tip_x"]
+            min_y = shank["min_y"]
 
-        # Process original points and insert extension points where needed
-        prev_at_top = False
-        for i, (x, y) in enumerate(zip(x_values, y_values)):
-            at_top = (y >= original_top_y - top_edge_tolerance)
+            # Calculate tip apex Y
+            tip_apex_y = min_y - contact_height / 2 - tip_length
 
-            if at_top and not prev_at_top:
-                # Transitioning TO top edge - add extension point first
-                new_points.append((x, shank_top))
+            if is_e_series:
+                # E-series: 3-STAGE SYMMETRIC TAPER
+                # STAGE 1: VERTICAL from top to 3rd highest electrode
+                # STAGE 2: WEAK TAPER from 3rd highest to 2nd lowest electrode
+                # STAGE 3: STRONG TAPER from 2nd lowest to tip (25µm)
+                # Reference: E_probe_layout.png
 
-            # Add original point (preserve taper geometry)
-            new_points.append((x, y))
+                # Get this shank's contacts for calculating taper stages
+                shank_contacts = None
+                if contacts_df is not None:
+                    shank_contacts = contacts_df[
+                        (contacts_df["x"] >= shank["left"] - 5)
+                        & (contacts_df["x"] <= shank["right"] + 5)
+                    ]
 
-            if not at_top and prev_at_top:
-                # Transitioning FROM top edge - already handled by keeping original point
-                pass
+                shank_x_min = shank["left"]
+                shank_x_max = shank["right"]
+                shank_y_min = shank["min_y"]
+                shank_center = (shank_x_min + shank_x_max) / 2
 
-            prev_at_top = at_top
+                # Margin for electrodes
+                e_margin = contact_width / 2 + 5  # Half contact width + buffer
 
-        # Close with top-right corner at full shank length
-        new_points.append((max_x, shank_length_um))
+                # Calculate width at TOP - use FULL electrode span (both columns)
+                half_width_top = (shank_x_max - shank_x_min) / 2 + e_margin
 
-        # Strategy: The contour traces down each shank and jumps horizontally between shanks.
-        # For each gap (horizontal jump at top), we need to add vertical extensions on both sides.
-        # Original: ... (66.5, 225) → (240, 230) ...  (jump across gap)
-        # Extended: ... (66.5, 225) → (66.5, 5800) → (240, 5800) → (240, 230) ...
+                # Tip specs
+                tip_width_e = 25  # µm from XML
+                half_width_tip = tip_width_e / 2
+                sharp_tip_y = shank_y_min - contact_height / 2 - tip_length
 
-        top_threshold = 50  # Points within 50µm of max_y are "top" points
-        gap_threshold = 60  # X jump > 60µm indicates gap between shanks (H10/F8/H16 have 68-95µm gaps)
+                # Find stage boundaries from electrode Y positions
+                if shank_contacts is not None and len(shank_contacts) > 0:
+                    positions = shank_contacts[["x", "y"]].values
+                    unique_y = sorted(set(positions[:, 1]))
+                    n_levels = len(unique_y)
 
-        new_points = []
-        new_points.append((min_x, shank_length_um))  # Top-left corner of merged section
-        new_points.append((min_x, shank_top))  # Extension point on left edge
+                    if n_levels >= 4:
+                        stage1_end_y = unique_y[-3]  # 3rd from top
+                        stage2_end_y = unique_y[0]   # LOWEST electrode (stage 3 is tip only)
+                    elif n_levels >= 2:
+                        mid_idx = n_levels // 2
+                        stage1_end_y = unique_y[mid_idx]
+                        stage2_end_y = unique_y[0]  # LOWEST electrode
+                    else:
+                        stage1_end_y = unique_y[0]
+                        stage2_end_y = unique_y[0]
 
-        n = len(x_values)
-        for i in range(n):
-            x, y = x_values[i], y_values[i]
-            is_top = (y >= original_top_y - top_threshold)
+                    # Calculate widths at each boundary based on electrode positions
+                    def get_half_width_at_y_level(y_level: float) -> float:
+                        tolerance = contact_height
+                        mask = np.abs(positions[:, 1] - y_level) <= tolerance
+                        if np.any(mask):
+                            x_at_level = positions[mask, 0]
+                            half_span = np.max(np.abs(x_at_level - shank_center))
+                            return half_span + e_margin
+                        return half_width_top
 
-            # Add current point
-            new_points.append((x, y))
+                    half_width_stage2_start = get_half_width_at_y_level(stage1_end_y)
 
-            # Check if this is followed by a horizontal jump (gap between shanks)
-            if i < n - 1:
-                next_x, next_y = x_values[i + 1], y_values[i + 1]
-                is_next_top = (next_y >= original_top_y - top_threshold)
-                x_jump = abs(next_x - x)
+                    # Stage 2 end width must accommodate ALL electrodes in bottom 2 levels
+                    bottom_levels = unique_y[:2] if n_levels >= 2 else unique_y
+                    bottom_mask = np.isin(positions[:, 1], bottom_levels)
+                    if np.any(bottom_mask):
+                        bottom_positions = positions[bottom_mask]
+                        bottom_half_span = np.max(np.abs(bottom_positions[:, 0] - shank_center))
+                        half_width_stage2_end = bottom_half_span + e_margin
+                    else:
+                        half_width_stage2_end = get_half_width_at_y_level(stage2_end_y)
+                else:
+                    # Fallback: linear taper
+                    stage1_end_y = shank_top - 100
+                    stage2_end_y = shank_y_min + 50
+                    half_width_stage2_start = half_width_top * 0.9
+                    half_width_stage2_end = half_width_top * 0.5
 
-                # If both current and next are "top" points with a large X gap, add extensions
-                if is_top and is_next_top and x_jump > gap_threshold:
-                    # Add vertical extension from current point up
-                    new_points.append((x, shank_top))
-                    # Add horizontal connection at extended height
-                    new_points.append((next_x, shank_top))
+                # Adjust Y for contour (bottom of electrodes)
+                stage1_end_contour_y = stage1_end_y - contact_height / 2
+                stage2_end_contour_y = stage2_end_y - contact_height / 2
 
-        # Add extension on right edge and close at top
-        new_points.append((max_x, shank_top))
-        new_points.append((max_x, shank_length_um))
+                # E-series 3-STAGE CONTOUR: left side down, tip, right side up
+                left_x_top = shank_center - half_width_top
+                right_x_top = shank_center + half_width_top
+
+                # STAGE 1: Vertical (left side, top to stage1_end)
+                new_points.append((left_x_top, shank_top))
+                new_points.append((shank_center - half_width_stage2_start, stage1_end_contour_y))
+
+                # STAGE 2: Weak taper (left side continues down)
+                new_points.append((shank_center - half_width_stage2_end, stage2_end_contour_y))
+
+                # STAGE 3: Strong taper to tip
+                new_points.append((shank_center, sharp_tip_y))  # Tip apex
+
+                # STAGE 3: Strong taper (right side going up)
+                new_points.append((shank_center + half_width_stage2_end, stage2_end_contour_y))
+
+                # STAGE 2: Weak taper (right side continues up)
+                new_points.append((shank_center + half_width_stage2_start, stage1_end_contour_y))
+
+                # STAGE 1: Vertical (right side, stage1_end to top)
+                new_points.append((right_x_top, shank_top))
+
+                logger.debug(
+                    f"{probe_name} shank {i}: E-series 3-STAGE contour - "
+                    f"top_width={half_width_top*2:.0f}µm, stage2_end_width={half_width_stage2_end*2:.0f}µm, "
+                    f"tip=({shank_center:.0f}, {sharp_tip_y:.0f})"
+                )
+
+            elif is_l_series:
+                # ============================================================
+                # L-series: 3-STAGE ASYMMETRIC TAPER (L13, L14)
+                # Reference: L13.png, L14.png
+                #
+                # Stage 1: Both sides VERTICAL until top site Y level
+                # Stage 2: LEFT stays vertical, RIGHT has weak taper (down to below bottom site)
+                # Stage 3: BOTH sides taper strongly to tip (tip at LEFT edge)
+                #
+                #     |-----------|     STAGE 1: Both sides vertical (above top site)
+                #     |           |
+                #     |-----------|     Y = top site level
+                #     |            \    STAGE 2: Left vertical, Right weak taper
+                #     |             \   (from top site to below bottom site)
+                #     |              \
+                #     |--------------\  Y = stage2_end (below bottom site)
+                #      \              \ STAGE 3: Both sides taper to tip
+                #       \              \
+                #        V              Tip at LEFT edge
+                # ============================================================
+
+                # Get this shank's contacts for calculating taper points
+                shank_contacts = None
+                if contacts_df is not None and "shank_ids" in contacts_df.columns:
+                    unique_shank_ids = sorted(contacts_df["shank_ids"].dropna().unique())
+                    unique_shank_ids = [s for s in unique_shank_ids if s != ""]
+                    if i < len(unique_shank_ids):
+                        shank_id = unique_shank_ids[i]
+                        shank_contacts = contacts_df[contacts_df["shank_ids"] == shank_id]
+
+                if shank_contacts is None or len(shank_contacts) == 0:
+                    shank_contacts = contacts_df[
+                        (contacts_df["x"] >= shank["left"] - 5)
+                        & (contacts_df["x"] <= shank["right"] + 5)
+                    ]
+
+                # L-series margin
+                l_margin = contact_width / 2 + 5
+
+                if len(shank_contacts) > 0:
+                    positions = shank_contacts[["x", "y"]].values
+                    shank_y_min = float(np.min(positions[:, 1]))
+                    shank_y_max = float(np.max(positions[:, 1]))
+
+                    # L-series electrodes are on the LEFT side of the shank
+                    # Left edge = leftmost electrode - margin
+                    left_edge_x = float(np.min(positions[:, 0])) - l_margin
+
+                    # Right edge = left edge + shank width (from geometry)
+                    # L13: 76µm, L14: 50µm
+                    if probe_type == "L13":
+                        shank_width_um = 76.0
+                    elif probe_type == "L14":
+                        shank_width_um = 50.0
+                    else:
+                        shank_width_um = 76.0  # Default
+                    right_edge_x = left_edge_x + shank_width_um
+
+                    # Stage boundaries:
+                    # Stage 1 ends at TOP electrode Y level
+                    # Stage 2 ends below BOTTOM electrode Y level
+                    stage1_end_y = shank_y_max - contact_height / 2  # Bottom of top electrode
+                    stage2_end_y = shank_y_min - contact_height / 2 - 10  # 10µm below bottom electrode
+
+                    # Calculate right edge position at stage 2 end
+                    # Right side tapers from right_edge_x at stage1_end to a narrower width at stage2_end
+                    # Weak taper: about 30-40% narrower
+                    right_at_stage2_end = left_edge_x + shank_width_um * 0.6
+
+                    # Tip position: at LEFT edge (asymmetric)
+                    tip_y = shank_y_min - contact_height / 2 - tip_length
+                    tip_x_left = left_edge_x  # Tip is at left edge
+
+                else:
+                    # Fallback values
+                    left_edge_x = left_x
+                    right_edge_x = right_x
+                    stage1_end_y = shank_top - 100
+                    stage2_end_y = min_y - 20
+                    right_at_stage2_end = right_x - 30
+                    tip_y = tip_apex_y
+                    tip_x_left = left_x
+
+                # L-series 3-STAGE ASYMMETRIC contour
+                # LEFT side: Vertical in stages 1&2, then tapers in stage 3
+                # RIGHT side: Vertical in stage 1, weak taper in stage 2, strong taper in stage 3
+                new_points.append((left_edge_x, shank_top))              # Top left (stage 1 start)
+                new_points.append((left_edge_x, stage1_end_y))           # Stage 1/2 boundary left (still vertical)
+                new_points.append((left_edge_x, stage2_end_y))           # Stage 2/3 boundary left (still vertical)
+                new_points.append((tip_x_left, tip_y))                   # Tip at LEFT edge
+                new_points.append((right_at_stage2_end, stage2_end_y))   # Stage 2/3 boundary right (after weak taper)
+                new_points.append((right_edge_x, stage1_end_y))          # Stage 1/2 boundary right (still full width)
+                new_points.append((right_edge_x, shank_top))             # Top right (stage 1 start)
+
+                logger.debug(
+                    f"{probe_name} shank {i}: L-series 3-STAGE asymmetric contour - "
+                    f"left={left_edge_x:.0f}, right={right_edge_x:.0f}, "
+                    f"stage1_end_y={stage1_end_y:.0f}, stage2_end_y={stage2_end_y:.0f}, "
+                    f"tip=({tip_x_left:.0f}, {tip_y:.0f})"
+                )
+
+            else:
+                # Non-E/L-series: Rectangular walls with V-tip at bottom
+                # All probes have tapered V-tips (no flat tips)
+
+                # Down to connection height on left edge
+                new_points.append((left_x, shank_top))
+                # Continue down left edge to just above tip
+                new_points.append((left_x, min_y - 10))
+                # V-tip: straight diagonal to apex
+                new_points.append((tip_x, tip_apex_y))
+                # V-tip: straight diagonal up to right edge
+                new_points.append((right_x, min_y - 10))
+                # Up to connection height on right edge
+                new_points.append((right_x, shank_top))
+
+            # Horizontal bridge to next shank (if not the last shank)
+            if i < len(shanks) - 1:
+                next_shank = shanks[i + 1]
+                next_center = (next_shank["left"] + next_shank["right"]) / 2
+                # Calculate per-shank width for next shank too
+                next_shank_span = next_shank["right"] - next_shank["left"]
+                next_required_half_width = next_shank_span / 2 + contact_width / 2 + contact_margin
+                next_per_shank_half_width = max(half_width, next_required_half_width)
+                next_left_x = next_center - next_per_shank_half_width
+                # Bridge at connection height (shank_top) - pure horizontal
+                new_points.append((next_left_x, shank_top))
+
+        # Close at top-right corner (200µm above shank length)
+        new_points.append((global_right, merge_top))
 
         # Remove duplicates while preserving order
         seen = set()
@@ -865,17 +1798,15 @@ class ProbeDataExtractor:
         result_df = pd.DataFrame(unique_points, columns=[x_col, y_col])
 
         logger.debug(
-            f"Extended multi-shank contour: {len(shanks)} shanks, "
-            f"individual shanks to {shank_top:.0f} µm, merge at {shank_length_um:.0f} µm"
+            f"Generated multi-shank contour: {len(shanks)} shanks, "
+            f"individual shanks to {shank_top:.0f} µm, merge at {merge_top:.0f} µm "
+            f"(200µm above shank length of {shank_length_um:.0f} µm)"
         )
 
         return result_df
 
     def _expand_contour_for_contacts(
-        self,
-        contour_df: pd.DataFrame,
-        contacts_df: pd.DataFrame,
-        buffer_margin: float = 1.0
+        self, contour_df: pd.DataFrame, contacts_df: pd.DataFrame, buffer_margin: float = 1.0
     ) -> pd.DataFrame:
         """
         Expand contour polygon to ensure all contact corners are enclosed.
@@ -931,7 +1862,7 @@ class ProbeDataExtractor:
                 return contour_df
 
             # Get exterior coordinates
-            if hasattr(expanded_polygon, 'exterior'):
+            if hasattr(expanded_polygon, "exterior"):
                 expanded_coords = list(expanded_polygon.exterior.coords)
             else:
                 # MultiPolygon - use convex hull
@@ -991,6 +1922,14 @@ class ProbeDataExtractor:
                 # Check if this is a multi-shank probe
                 is_multi_shank = self._is_multi_shank_probe(contacts_df)
 
+                # Check probe type for special handling
+                probe_type = self._get_probe_type_from_folder(probe_name)
+                is_e_series = probe_type and probe_type.startswith("E")
+                is_h13 = probe_type == "H13"
+                is_m_series = probe_type and probe_type.startswith("M") and probe_type in (
+                    "M1", "M1v1", "M1v2", "M2", "M2v1", "M2v2", "M3"
+                )
+
                 if is_multi_shank:
                     # For multi-shank probes: DON'T use buffer expansion
                     # Use special extension that extends each shank individually
@@ -998,6 +1937,26 @@ class ProbeDataExtractor:
                     # Pass probe_name to look up tip_length from database
                     extended_df = self._extend_multishank_contour(df, contacts_df, probe_name)
                     logger.debug(f"{probe_name}: Multi-shank probe, extending shanks individually")
+                elif is_e_series:
+                    # E-series single-shank: Generate V-tapered contour from scratch
+                    extended_df = self._generate_e_series_single_shank_contour(
+                        df, contacts_df, probe_name
+                    )
+                    logger.debug(
+                        f"{probe_name}: E-series single-shank, generating V-tapered contour"
+                    )
+                elif is_h13:
+                    # H13: Full shank taper 140µm→20µm
+                    extended_df = self._generate_h13_tapered_shank_contour(
+                        df, contacts_df, probe_name
+                    )
+                    logger.info(f"{probe_name}: H13, generating full-shank tapered contour")
+                elif is_m_series:
+                    # M-series: Fixed 140µm shank width (large animal probes)
+                    extended_df = self._generate_m_series_contour(
+                        df, contacts_df, probe_name
+                    )
+                    logger.info(f"{probe_name}: M-series, generating 140µm wide contour")
                 else:
                     # For single-shank probes: expand for contacts, then extend
                     # Pass contacts_df to center the tip on contacts
@@ -1025,7 +1984,6 @@ class ProbeDataExtractor:
         Returns:
             List of shank IDs (as strings "0", "1", "2", ...) for each contact
         """
-        import numpy as np
 
         if len(x_positions) == 0:
             return []
@@ -1055,9 +2013,7 @@ class ProbeDataExtractor:
         # Assign shank ID to each contact
         shank_ids = [x_to_shank[x] for x in x_positions]
 
-        logger.debug(
-            f"Detected {len(shank_clusters)} shanks from {len(x_positions)} contacts"
-        )
+        logger.debug(f"Detected {len(shank_clusters)} shanks from {len(x_positions)} contacts")
 
         return shank_ids
 
@@ -1187,7 +2143,9 @@ class ProbeDataExtractor:
                     extended_contour = contour_df[["x", "y"]].values.tolist()
 
             # Fall back to raw contour if no extended contour available
-            raw_contour = extended_contour if extended_contour else metadata.get("raw_contour_2d", [])
+            raw_contour = (
+                extended_contour if extended_contour else metadata.get("raw_contour_2d", [])
+            )
 
             # 1. Check for non-unique contact IDs (CRITICAL)
             contact_ids = df["contact_ids"].tolist()
@@ -1219,21 +2177,18 @@ class ProbeDataExtractor:
                     logger.warning(f"  {warn_msg}")
                 else:
                     logger.info(
-                        f"  {probe_name}: Shank count validated "
-                        f"({detected_shank_count} shanks)"
+                        f"  {probe_name}: Shank count validated ({detected_shank_count} shanks)"
                     )
 
             # 4. Create probeinterface Probe object with native contact_sides support
             # Uses PR #382 feature: contact_sides parameter in set_contacts()
             probegroup = pi.ProbeGroup()
 
-            # Create probe with 2D coordinates for visualization
-            # For both dual-sided and single-sided probes: x, y (y is vertical position)
-            # z is the depth/side indicator for dual-sided, or shank thickness for single-sided
-            positions = np.column_stack([
-                df["x"].values,
-                df["y"].values
-            ])
+            # Create probe with coordinates
+            # Use 2D coordinates (x, y) - probeinterface handles side differentiation via contact_sides
+            x_coords = df["x"].values
+            y_coords = df["y"].values
+            positions = np.column_stack([x_coords, y_coords])
 
             # Build shape_params as list of dicts (one per contact)
             if "width" in df.columns:
@@ -1245,8 +2200,7 @@ class ProbeDataExtractor:
             else:
                 heights = [12] * len(df)
             shape_params = [
-                {"width": float(w), "height": float(h)}
-                for w, h in zip(widths, heights)
+                {"width": float(w), "height": float(h)} for w, h in zip(widths, heights)
             ]
 
             if "contact_shapes" in df.columns:
@@ -1258,25 +2212,169 @@ class ProbeDataExtractor:
             x_positions = df["x"].tolist()
             shank_ids = self._detect_shank_ids_from_positions(x_positions)
 
+            # Check for duplicate positions (can occur with dual-sided probes)
+            unique_positions = np.unique(positions, axis=0)
+            has_duplicates = len(unique_positions) < len(positions)
+
+            # Always use 2D probe
             probe = pi.Probe(ndim=2)
 
-            # For dual-sided probes, use native contact_sides parameter (PR #382)
+            # For dual-sided probes with duplicate positions, skip probeinterface creation
+            # These will be handled manually in output files
+            if is_dual and has_duplicates:
+                logger.warning(
+                    f"  {probe_name}: Skipping probeinterface probe (dual-sided with "
+                    f"{len(positions)} contacts at {len(unique_positions)} positions). "
+                    f"Will use extracted contact data directly."
+                )
+                # Still save JSON and PNG, just not through probeinterface
+                json_path = sanity_dir / f"{probe_name}_sanity.json"
+                png_path = sanity_dir / f"{probe_name}_sanity.png"
+
+                # Write extracted contact data as JSON
+                contact_data = {
+                    "probe_name": probe_name,
+                    "contact_count": len(df),
+                    "contacts": df.to_dict("records"),
+                    "note": "Dual-sided probe with multiple contacts per (x, y) position",
+                }
+                with open(json_path, "w") as f:
+                    json.dump(contact_data, f, indent=2)
+
+                # Generate PNG manually for dual-sided probes
+                from matplotlib.patches import Polygon as MplPolygon, Rectangle
+
+                fig, axes = plt.subplots(1, 2, figsize=(20, 12))
+
+                for i, side_name in enumerate(["front", "back"]):
+                    ax = axes[i]
+
+                    # Filter contacts by side (column is "contact_sides" not "side")
+                    if "contact_sides" in df.columns:
+                        side_df = df[df["contact_sides"] == side_name]
+                    elif "side" in df.columns:
+                        side_df = df[df["side"] == side_name]
+                    else:
+                        side_df = df
+
+                    # Draw contour from extended contours
+                    if raw_contour and len(raw_contour) > 2:
+                        contour_array = np.array(raw_contour)
+                        poly = MplPolygon(
+                            contour_array,
+                            closed=True,
+                            facecolor="lightgreen",
+                            edgecolor="green",
+                            alpha=0.5,
+                            linewidth=1,
+                            zorder=1,
+                        )
+                        ax.add_patch(poly)
+
+                    # Draw contacts as rectangles
+                    for _, contact in side_df.iterrows():
+                        cx, cy = contact["x"], contact["y"]
+                        w = contact.get("width", 12)
+                        h = contact.get("height", 12)
+                        rect = Rectangle(
+                            (cx - w / 2, cy - h / 2),
+                            w,
+                            h,
+                            facecolor="orange",
+                            edgecolor="darkred",
+                            alpha=0.7,
+                            linewidth=0.5,
+                            zorder=2,
+                        )
+                        ax.add_patch(rect)
+
+                    ax.set_aspect("equal")
+                    ax.autoscale_view()
+                    ax.set_xlabel("x (µm)")
+                    ax.set_ylabel("y (µm)")
+                    ax.set_title(f"{probe_name} - {side_name.capitalize()}")
+
+                plt.tight_layout()
+                plt.savefig(png_path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+
+                # Save zoomed version - create new figure with explicit limits
+                y_coords = df["y"].values
+                x_coords = df["x"].values
+                y_min, y_max = y_coords.min(), y_coords.max()
+                x_min, x_max = x_coords.min(), x_coords.max()
+                x_margin = (x_max - x_min) * 0.1  # 10% margin
+                xlim = (x_min - x_margin - 20, x_max + x_margin + 20)
+                ylim = (y_min - 200, y_max + 200)
+
+                fig_zoom, axes_zoom = plt.subplots(1, 2, figsize=(20, 12))
+                for i, side_name in enumerate(["front", "back"]):
+                    ax = axes_zoom[i]
+                    side_df = df[df["contact_sides"] == side_name]
+
+                    # Draw contour
+                    if raw_contour and len(raw_contour) > 2:
+                        contour_array = np.array(raw_contour)
+                        poly = MplPolygon(
+                            contour_array, closed=True,
+                            facecolor="lightgreen", edgecolor="green",
+                            alpha=0.5, linewidth=1, zorder=1,
+                        )
+                        ax.add_patch(poly)
+
+                    # Draw contacts
+                    for _, contact in side_df.iterrows():
+                        cx, cy = contact["x"], contact["y"]
+                        w = contact.get("width", 12)
+                        h = contact.get("height", 12)
+                        rect = Rectangle(
+                            (cx - w / 2, cy - h / 2), w, h,
+                            facecolor="orange", edgecolor="darkred",
+                            alpha=0.7, linewidth=0.5, zorder=2,
+                        )
+                        ax.add_patch(rect)
+
+                    # Set synchronized limits BEFORE autoscale
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                    ax.set_xlabel("x (µm)")
+                    ax.set_ylabel("y (µm)")
+                    ax.set_title(f"{probe_name} - {side_name.capitalize()} (zoomed)")
+
+                plt.tight_layout()
+                zoomed_path = sanity_dir / f"{probe_name}_sanity_zoomed.png"
+                plt.savefig(zoomed_path, dpi=150, bbox_inches="tight")
+                plt.close(fig_zoom)
+
+                logger.info(f"  {probe_name}: JSON + PNG written (direct contact data)")
+                continue
+
+            # For probes with unique positions, create probeinterface probe
+            # For dual-sided probes, try to use contact_sides (if probeinterface version supports it)
             if is_dual and "contact_sides" in df.columns:
                 # Get contact_sides values, converting empty strings to None
                 contact_sides_raw = df["contact_sides"].values
-                contact_sides = np.array([
-                    s if s in ("front", "back") else None
-                    for s in contact_sides_raw
-                ])
-
-                probe.set_contacts(
-                    positions=positions,
-                    shapes=shapes,
-                    shape_params=shape_params,
-                    shank_ids=np.array(shank_ids),
-                    contact_sides=contact_sides,  # Native dual-sided support from PR #382
+                contact_sides = np.array(
+                    [s if s in ("front", "back") else None for s in contact_sides_raw]
                 )
-                logger.debug(f"  {probe_name}: Using native contact_sides parameter")
+
+                try:
+                    probe.set_contacts(
+                        positions=positions,
+                        shapes=shapes,
+                        shape_params=shape_params,
+                        shank_ids=np.array(shank_ids),
+                        contact_sides=contact_sides,  # Native dual-sided support (if available)
+                    )
+                except TypeError:
+                    # contact_sides not supported in this probeinterface version
+                    probe.set_contacts(
+                        positions=positions,
+                        shapes=shapes,
+                        shape_params=shape_params,
+                        shank_ids=np.array(shank_ids),
+                    )
+                logger.debug(f"  {probe_name}: Using contact_sides parameter")
             else:
                 probe.set_contacts(
                     positions=positions,
@@ -1325,12 +2423,24 @@ class ProbeDataExtractor:
                     # Draw contour manually FIRST (handles concave polygons correctly)
                     if probe.probe_planar_contour is not None:
                         contour = probe.probe_planar_contour
-                        poly = MplPolygon(contour, closed=True, facecolor="lightgreen",
-                                          edgecolor="green", alpha=0.5, linewidth=1, zorder=1)
+                        poly = MplPolygon(
+                            contour,
+                            closed=True,
+                            facecolor="lightgreen",
+                            edgecolor="green",
+                            alpha=0.5,
+                            linewidth=1,
+                            zorder=1,
+                        )
                         ax.add_patch(poly)
                     # Draw contacts using probeinterface with side filter (PR #382)
-                    plot_probe(probe, ax=ax, with_contact_id=False, side=side_name,
-                               probe_shape_kwargs={"facecolor": "none", "edgecolor": "none", "alpha": 0})
+                    plot_probe(
+                        probe,
+                        ax=ax,
+                        with_contact_id=False,
+                        side=side_name,
+                        probe_shape_kwargs={"facecolor": "none", "edgecolor": "none", "alpha": 0},
+                    )
                     title = f"{probe_name} - {side_name.capitalize()}"
                     if has_duplicates:
                         title += "\n⚠️ DUPLICATE IDs"
@@ -1341,12 +2451,23 @@ class ProbeDataExtractor:
                 # Draw contour manually FIRST (handles concave polygons correctly)
                 if probe.probe_planar_contour is not None:
                     contour = probe.probe_planar_contour
-                    poly = MplPolygon(contour, closed=True, facecolor="lightgreen",
-                                      edgecolor="green", alpha=0.5, linewidth=1, zorder=1)
+                    poly = MplPolygon(
+                        contour,
+                        closed=True,
+                        facecolor="lightgreen",
+                        edgecolor="green",
+                        alpha=0.5,
+                        linewidth=1,
+                        zorder=1,
+                    )
                     ax.add_patch(poly)
                 # Draw contacts using probeinterface (hide its contour completely)
-                plot_probe(probe, ax=ax, with_contact_id=False,
-                           probe_shape_kwargs={"facecolor": "none", "edgecolor": "none", "alpha": 0})
+                plot_probe(
+                    probe,
+                    ax=ax,
+                    with_contact_id=False,
+                    probe_shape_kwargs={"facecolor": "none", "edgecolor": "none", "alpha": 0},
+                )
                 title = f"{probe_name}"
                 if has_duplicates:
                     title += "\n⚠️ DUPLICATE IDs"
@@ -1354,17 +2475,38 @@ class ProbeDataExtractor:
 
             plt.tight_layout()
             plt.savefig(png_path, dpi=150, bbox_inches="tight")
+
+            # Save zoomed version focused on electrode sites
+            # Y limits: 200µm below lowest site to 200µm above highest site
+            # X limits: synchronized across subplots for dual-sided
+            contact_positions = probe.contact_positions
+            y_coords = contact_positions[:, 1]
+            x_coords = contact_positions[:, 0]
+            y_min, y_max = y_coords.min(), y_coords.max()
+            x_min, x_max = x_coords.min(), x_coords.max()
+            x_margin = (x_max - x_min) * 0.1  # 10% margin
+            if is_dual and "contact_sides" in df.columns:
+                # Dual-sided: set ylim and xlim on both axes (synchronized)
+                for ax in axes:
+                    ax.set_aspect("auto")  # Disable equal aspect for zoomed view
+                    ax.set_ylim(y_min - 200, y_max + 200)
+                    ax.set_xlim(x_min - x_margin - 20, x_max + x_margin + 20)
+            else:
+                # Single-sided: single axis
+                ax.set_ylim(y_min - 200, y_max + 200)
+            zoomed_path = sanity_dir / f"{probe_name}_sanity_zoomed.png"
+            plt.savefig(zoomed_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
 
             logger.info(f"  {probe_name}: JSON + PNG written")
 
         # Report validation summary
         if validation_errors:
-            logger.error(f"\n{'='*60}")
+            logger.error(f"\n{'=' * 60}")
             logger.error(f"VALIDATION ERRORS FOUND: {len(validation_errors)}")
             for err in validation_errors:
                 logger.error(f"  - {err}")
-            logger.error(f"{'='*60}")
+            logger.error(f"{'=' * 60}")
 
     def generate_summary(self, metadata_list: List[Dict]) -> bool:
         """
@@ -1387,10 +2529,11 @@ class ProbeDataExtractor:
         if dual_sided:
             print("\nDual-sided probes found:")
             for m in dual_sided:
-                thickness = m['shank_thickness']
+                thickness = m["shank_thickness"]
                 thickness_str = f"{thickness} µm" if thickness else "MISSING"
-                print(f"  - {m['name']}: {m['total_contacts']} contacts, "
-                      f"thickness: {thickness_str}")
+                print(
+                    f"  - {m['name']}: {m['total_contacts']} contacts, thickness: {thickness_str}"
+                )
 
         print("\nOutput files:")
         print(f"  - {self.output_dir / 'probe_contacts.xlsx'}")
@@ -1404,7 +2547,9 @@ class ProbeDataExtractor:
             for error in self.validation_errors:
                 print(f"  ERROR: {error}")
             print("!" * 60)
-            logger.error(f"Extraction completed with {len(self.validation_errors)} validation errors")
+            logger.error(
+                f"Extraction completed with {len(self.validation_errors)} validation errors"
+            )
             return False
 
         print("\nValidation: All contact IDs are unique")
@@ -1447,31 +2592,24 @@ def main() -> int:
         "--library",
         type=Path,
         default=default_library,
-        help="Path to probe library folder containing JSON files"
+        help="Path to probe library folder containing JSON files",
     )
     parser.add_argument(
         "--database",
         type=Path,
         default=default_database,
-        help="Path to shank thickness database CSV file"
+        help="Path to shank thickness database CSV file",
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=default_output,
-        help="Output directory for Excel files"
+        "--output", type=Path, default=default_output, help="Output directory for Excel files"
     )
     parser.add_argument(
         "--contact-id-excel",
         type=Path,
         default=None,
-        help="Path to ProbeMaps_Final2025_SW.xlsx for contact ID mapping"
+        help="Path to ProbeMaps_Final2025_SW.xlsx for contact ID mapping",
     )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
     args = parser.parse_args()
 
@@ -1500,9 +2638,7 @@ def main() -> int:
                     logger.info(f"Auto-detected contact ID Excel: {contact_id_excel}")
                     break
             except PermissionError:
-                logger.warning(
-                    f"Permission denied accessing {p} - file may be open in Excel"
-                )
+                logger.warning(f"Permission denied accessing {p} - file may be open in Excel")
                 continue
 
     # Validate paths
@@ -1512,9 +2648,7 @@ def main() -> int:
         raise FileNotFoundError(f"Database path not found: {database_path}")
 
     # Create extractor and run
-    extractor = ProbeDataExtractor(
-        library_path, database_path, output_dir, contact_id_excel
-    )
+    extractor = ProbeDataExtractor(library_path, database_path, output_dir, contact_id_excel)
 
     # Process all probes
     contacts, contours, metadata = extractor.process_all_probes()
@@ -1534,4 +2668,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())
