@@ -1080,7 +1080,7 @@ class ProbeDataExtractor:
 
         # M-series fixed dimensions
         shank_width = 140.0  # µm - fixed width for all M-series
-        tip_extension = 50  # µm below lowest electrode
+        tip_extension = 150  # µm below lowest electrode (sharpened tip per reference images)
 
         # Determine probe type for taper start
         probe_type = self._get_probe_type_from_folder(probe_name) if probe_name else None
@@ -1133,10 +1133,27 @@ class ProbeDataExtractor:
         # Build 2-stage ASYMMETRIC contour
         # Stage 1: Both sides vertical from top to taper_start_y
         # Stage 2: Left stays vertical, right tapers to meet at tip (LEFT edge)
+        # IMPORTANT: Right side must stay wide enough to contain bottom electrodes
+
+        # Calculate where right edge should be at bottom electrode level
+        # to ensure no electrodes extrude from the taper
+        bottom_electrode_y = y_min - contact_height / 2 - 5  # Small margin below bottom electrode
+
+        # Get rightmost electrode X at the bottom levels (below taper start)
+        bottom_mask = positions[:, 1] < unique_y[taper_start_idx]
+        if np.any(bottom_mask):
+            rightmost_bottom_x = float(np.max(positions[bottom_mask, 0]))
+            # Right edge at bottom must contain the rightmost bottom electrode + margin
+            right_at_bottom = max(rightmost_bottom_x + contact_height / 2 + 10, contact_center_x)
+        else:
+            right_at_bottom = right_edge_x
+
         contour_points = [
             (left_edge_x, shank_length_um),      # Top-left
             (left_edge_x, taper_start_y),        # Stage 1/2 boundary left (still vertical)
-            (left_edge_x, tip_apex_y),           # Tip at LEFT edge (left stayed vertical)
+            (left_edge_x, bottom_electrode_y),   # Left at bottom electrode level (still vertical)
+            (left_edge_x, tip_apex_y),           # Tip at LEFT edge
+            (right_at_bottom, bottom_electrode_y),  # Right at bottom electrode level (wide enough for electrodes)
             (right_edge_x, taper_start_y),       # Stage 1/2 boundary right (taper starts here)
             (right_edge_x, shank_length_um),     # Top-right
         ]
